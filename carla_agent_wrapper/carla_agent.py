@@ -236,9 +236,13 @@ class CarlaAgentAV:
             logger.info("Initializing CARLA world (attempt %d)...", i + 1)
             try:
                 self._connect()
-                return
+                break
             except Exception:
                 logger.exception("Failed to initialize CARLA world (attempt %d)", i + 1)
+                if i == self._max_retry_times - 1:
+                    raise RuntimeError(
+                        "Exceeded maximum retry attempts for CARLA connection"
+                    )
                 time.sleep(1.0)
         logger.info("CarlaAgentAV initialized.")
 

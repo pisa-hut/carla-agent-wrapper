@@ -63,28 +63,16 @@ class AVServer(av_server_pb2_grpc.AvServerServicer):
         output_dir = request.output_dir.path
         scenario_pack = request.scenario_pack
         initial_observation = request.initial_observation
-        try:
-            ret = self._av.reset(output_dir, scenario_pack, initial_observation)
-        except Exception as e:
-            logger.exception("Failed to reset AV in Reset")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(f"Carla-Agent Reset failed: {str(e)}")
-            return av_server_pb2.AvServerMessages.ResetResponse(
-                ctrl_cmd=f"Reset failed: {str(e)}"
-            )
-        return av_server_pb2.AvServerMessages.ResetResponse(ctrl_cmd=ret)
+        return av_server_pb2.AvServerMessages.ResetResponse(
+            ctrl_cmd=self._av.reset(output_dir, scenario_pack, initial_observation)
+        )
 
     def Step(self, request, context):
         observation = request.observation
         timestamp_ns = request.timestamp_ns
-        try:
-            ret = self._av.step(observation, timestamp_ns)
-            return av_server_pb2.AvServerMessages.StepResponse(ctrl_cmd=ret)
-        except Exception as e:
-            logger.exception("Failed to step AV in Step")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(f"Carla-Agent Step failed: {str(e)}")
-            return av_server_pb2.AvServerMessages.StepResponse(ctrl_cmd={})
+        return av_server_pb2.AvServerMessages.StepResponse(
+            ctrl_cmd=self._av.step(observation, timestamp_ns)
+        )
 
     def Stop(self, request, context):
         if self._av is not None:
