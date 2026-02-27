@@ -46,26 +46,45 @@ class AVServer(av_server_pb2_grpc.AvServerServicer):
                 self._av = None
 
         self._av = CarlaAgentAV(output_dir, config)
-        self._av.init(scenario_pack)
-
-        return av_server_pb2.AvServerMessages.InitResponse(
-            success=True, msg="Initialization successful"
-        )
+        try:
+            self._av.init(scenario_pack)
+            return av_server_pb2.AvServerMessages.InitResponse(
+                success=True, msg="Initialization successful"
+            )
+        except Exception as e:
+            logger.exception("Failed to initialize AV in Init")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Carla-Agent Initialization failed: {str(e)}")
+            return av_server_pb2.AvServerMessages.InitResponse(
+                success=False, msg=f"Initialization failed: {str(e)}"
+            )
 
     def Reset(self, request, context):
         output_dir = request.output_dir.path
         scenario_pack = request.scenario_pack
         initial_observation = request.initial_observation
-        return av_server_pb2.AvServerMessages.ResetResponse(
-            ctrl_cmd=self._av.reset(output_dir, scenario_pack, initial_observation)
-        )
+        try:
+            ret = self._av.reset(output_dir, scenario_pack, initial_observation)
+        except Exception as e:
+            logger.exception("Failed to reset AV in Reset")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Carla-Agent Reset failed: {str(e)}")
+            return av_server_pb2.AvServerMessages.ResetResponse(
+                ctrl_cmd=f"Reset failed: {str(e)}"
+            )
+        return av_server_pb2.AvServerMessages.ResetResponse(ctrl_cmd=ret)
 
     def Step(self, request, context):
         observation = request.observation
         timestamp_ns = request.timestamp_ns
-        return av_server_pb2.AvServerMessages.StepResponse(
-            ctrl_cmd=self._av.step(observation, timestamp_ns)
-        )
+        try:
+            ret = self._av.step(observation, timestamp_ns)
+            return av_server_pb2.AvServerMessages.StepResponse(ctrl_cmd=ret)
+        except Exception as e:
+            logger.exception("Failed to step AV in Step")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Carla-Agent Step failed: {str(e)}")
+            return av_server_pb2.AvServerMessages.StepResponse(ctrl_cmd={})
 
     def Stop(self, request, context):
         if self._av is not None:
