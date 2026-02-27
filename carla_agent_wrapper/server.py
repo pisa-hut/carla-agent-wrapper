@@ -1,0 +1,102 @@
+import os
+from concurrent import futures
+import grpc
+from google.protobuf.json_format import MessageToDict
+from pprint import pprint
+
+from sbsvf_api import av_server_pb2, av_server_pb2_grpc
+from sbsvf_api.pong_pb2 import Pong
+from sbsvf_api.empty_pb2 import Empty
+
+from carla_agent import CarlaAgentAV
+
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+
+
+class AVServer(av_server_pb2_grpc.AvServerServicer):
+    def __init__(self):
+        super().__init__()
+        self._av = None
+
+    def Ping(self, request, context):
+        logger.info(f"Received ping from client: {context.peer()}")
+        return Pong(msg="CARLA-Agent alive")
+
+    def Init(self, request, context):
+        output_dir = request.output_dir.path
+        config = MessageToDict(request.config.config)
+        scenario_pack = request.scenario_pack
+        print("output_dir:", output_dir)
+        print("config:", config)
+
+        if self._av is not None:
+            try:
+                logger.info("Init called while AV exists; stopping previous instance.")
+                self._av.stop()
+            except Exception:
+                logger.exception("Failed to stop previous AV instance on Init")
+            finally:
+                self._av = None
+
+        self._av = CarlaAgentAV(output_dir, config)
+        self._av.init(scenario_pack)
+
+        return av_server_pb2.AvServerMessages.InitResponse(
+            success=True, msg="Initialization successful"
+        )
+
+    def Reset(self, request, context):
+        output_dir = request.output_dir.path
+        scenario_pack = request.scenario_pack
+        initial_observation = request.initial_observation
+        return av_server_pb2.AvServerMessages.ResetResponse(
+            ctrl_cmd=self._av.reset(output_dir, scenario_pack, initial_observation)
+        )
+
+    def Step(self, request, context):
+        observation = request.observation
+        timestamp_ns = request.timestamp_ns
+        return av_server_pb2.AvServerMessages.StepResponse(
+            ctrl_cmd=self._av.step(observation, timestamp_ns)
+        )
+
+    def Stop(self, request, context):
+        if self._av is not None:
+            self._av.stop()
+        return Empty()
+
+    def ShouldQuit(self, request, context):
+        should_quit = self._av.should_quit()
+        return av_server_pb2.AvServerMessages.ShouldQuitResponse(
+            should_quit=should_quit
+        )
+
+
+def serve():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+
+    av_server_pb2_grpc.add_AvServerServicer_to_server(AVServer(), server)
+
+    PORT = os.environ.get("PORT", "50051")
+
+    server.add_insecure_port(f"[::]:{PORT}")
+    server.start()
+
+    print(f"gRPC server is running on port {PORT}")
+
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        print("Shutting down gRPC server")
+        server.stop(0)
+
+
+if __name__ == "__main__":
+    serve()
