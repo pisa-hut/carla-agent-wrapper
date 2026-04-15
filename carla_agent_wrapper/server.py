@@ -2,11 +2,10 @@ import os
 from concurrent import futures
 import grpc
 from google.protobuf.json_format import MessageToDict
-from pprint import pprint
 
-from sbsvf_api import av_server_pb2, av_server_pb2_grpc
-from sbsvf_api.pong_pb2 import Pong
-from sbsvf_api.empty_pb2 import Empty
+from pisa_api import av_server_pb2, av_server_pb2_grpc
+from pisa_api.pong_pb2 import Pong
+from pisa_api.empty_pb2 import Empty
 
 from carla_agent import CarlaAgentAV
 
@@ -23,31 +22,20 @@ logging.basicConfig(
 class AVServer(av_server_pb2_grpc.AvServerServicer):
     def __init__(self):
         super().__init__()
-        self._av = None
+        self._av = CarlaAgentAV()
 
     def Ping(self, request, context):
         logger.info(f"Received ping from client: {context.peer()}")
         return Pong(msg="CARLA-Agent alive")
 
     def Init(self, request, context):
-        output_dir = request.output_dir.path
         config = MessageToDict(request.config.config)
-        scenario_pack = request.scenario_pack
-        print("output_dir:", output_dir)
-        print("config:", config)
+        output_dir = request.output_dir.path
+        map_name = request.map_name
+        logger.debug("Init config: %s", config)
 
-        if self._av is not None:
-            try:
-                logger.info("Init called while AV exists; stopping previous instance.")
-                self._av.stop()
-            except Exception:
-                logger.exception("Failed to stop previous AV instance on Init")
-            finally:
-                self._av = None
-
-        self._av = CarlaAgentAV(output_dir, config)
         try:
-            self._av.init(scenario_pack)
+            self._av.init(config, output_dir, map_name)
             return av_server_pb2.AvServerMessages.InitResponse(
                 success=True, msg="Initialization successful"
             )
