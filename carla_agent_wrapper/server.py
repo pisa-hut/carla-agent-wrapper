@@ -4,9 +4,9 @@ import grpc
 from google.protobuf.json_format import MessageToDict
 from pprint import pprint
 
-from sbsvf_api import av_server_pb2, av_server_pb2_grpc
-from sbsvf_api.pong_pb2 import Pong
-from sbsvf_api.empty_pb2 import Empty
+from pisa_api import av_server_pb2, av_server_pb2_grpc
+from pisa_api.pong_pb2 import Pong
+from pisa_api.empty_pb2 import Empty
 
 from carla_agent import CarlaAgentAV
 

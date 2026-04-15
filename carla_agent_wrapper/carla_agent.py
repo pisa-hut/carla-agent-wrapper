@@ -7,9 +7,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from sbsvf_api.control_pb2 import CtrlCmd, CtrlMode
-from sbsvf_api.object_pb2 import ObjectState, RoadObjectType
-from sbsvf_api.scenario_pb2 import ScenarioPack
+from pisa_api.control_pb2 import CtrlCmd, CtrlMode
+from pisa_api.object_pb2 import ObjectState, RoadObjectType
+from pisa_api.scenario_pb2 import ScenarioPack
 
 logger = logging.getLogger(__name__)
 
