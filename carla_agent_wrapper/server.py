@@ -2,7 +2,6 @@ import os
 from concurrent import futures
 import grpc
 from google.protobuf.json_format import MessageToDict
-from pprint import pprint
 
 from pisa_api import av_server_pb2, av_server_pb2_grpc
 from pisa_api.pong_pb2 import Pong
@@ -33,7 +32,7 @@ class AVServer(av_server_pb2_grpc.AvServerServicer):
         config = MessageToDict(request.config.config)
         output_dir = request.output_dir.path
         map_name = request.map_name
-        pprint(config)
+        logger.debug("Init config: %s", config)
 
         try:
             self._av.init(config, output_dir, map_name)
