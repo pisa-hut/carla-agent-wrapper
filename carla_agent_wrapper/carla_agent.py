@@ -1,3 +1,4 @@
+import subprocess
 import logging
 import math
 import os
@@ -7,11 +8,26 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+
 from pisa_api.control_pb2 import CtrlCmd, CtrlMode
 from pisa_api.object_pb2 import ObjectState, RoadObjectType
 from pisa_api.scenario_pb2 import ScenarioPack
 
+import carla
+
+from agents.navigation.behavior_agent import BehaviorAgent
+from agents.navigation.basic_agent import BasicAgent
+from agents.navigation.constant_velocity_agent import ConstantVelocityAgent
+
+import logging
+
 logger = logging.getLogger(__name__)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
+)
 
 
 class CarlaAgentAV:
@@ -22,50 +38,18 @@ class CarlaAgentAV:
     - step(): run agent.run_step(), convert to CtrlCmd
     """
 
-    def __init__(self, output_dir: str, cfg: dict):
-        # os.makedirs(output_dir, exist_ok=True)
-        self._output_dir = Path(output_dir)
-        self.config = cfg or {}
-        # self.config = self.config.get("carla", self.config)
+    def __init__(self):
+        self._carla = carla
+        self._BehaviorAgent = BehaviorAgent
+        self._BasicAgent = BasicAgent
+        self._ConstantVelocityAgent = ConstantVelocityAgent
 
-        self._host = os.environ.get("CARLA_HOST", self.config.get("host", "localhost"))
-        self._port = int(os.environ.get("CARLA_PORT", self.config.get("port", 2000)))
-        self._timeout = float(self.config.get("timeout", 10.0))
-
-        self._carla_root = self.config.get("carla_root") or os.environ.get("CARLA_ROOT")
-        self._carla_egg = self.config.get("carla_egg")
-        self._sync = bool(self.config.get("sync", True))
-        self._no_rendering = bool(self.config.get("no_rendering", True))
-        self._fixed_delta_seconds = self.config.get("fixed_delta_seconds", 0.01)
-
-        self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._ego_bp_id = self.config.get("ego_bp_id", "vehicle.tesla.model3")
-        self._agent_type = str(self.config.get("agent_type", "behavior")).lower()
-        self._behavior = str(self.config.get("behavior", "normal")).lower()
-        self._random_destination = bool(self.config.get("random_destination", False))
-        self._follow_speed_limits = bool(self.config.get("follow_speed_limits", False))
-        self._ignore_traffic_lights = bool(
-            self.config.get("ignore_traffic_lights", False)
-        )
-        self._ignore_stop_signs = bool(self.config.get("ignore_stop_signs", False))
-        self._ignore_vehicles = bool(self.config.get("ignore_vehicles", False))
-
-        self._target_speed = self.config.get("target_speed", None)
-        self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
-
-        self._yaw_sign = float(self.config.get("yaw_sign", -1.0))
-        self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
-        self._max_wait_sec = float(self.config.get("max_wait_sec", 10.0))
-        self._spawn_z_offset = float(self.config.get("spawn_z_offset", 3.0))
-        self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
-        self._max_retry_times = int(self.config.get("max_retry_times", 10))
+        self._host = os.environ.get("CARLA_HOST", "localhost")
+        self._port = int(os.environ.get("CARLA_PORT", 2000))
+        self._timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
 
         self._original_settings = None
         self._spawned_actor_ids = set()
-        self._carla = None
-        self._BehaviorAgent = None
-        self._BasicAgent = None
-        self._ConstantVelocityAgent = None
 
         self._client = None
         self._world = None
@@ -78,61 +62,41 @@ class CarlaAgentAV:
         self._sps: Optional[ScenarioPack] = None
         self._quit_flag = False
 
-    def _ensure_carla_imports(self) -> None:
-        if self._carla is not None:
-            return
+        subprocess.Popen(
+            ["/app/carla_server.sh"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
-        entries: list[str] = []
-        if self._carla_root:
-            root = Path(self._carla_root)
-            entries.append(str(root / "PythonAPI"))
-            entries.append(str(root / "PythonAPI" / "carla"))
-            dist_dir = root / "PythonAPI" / "carla" / "dist"
-            if self._carla_egg is None and dist_dir.exists():
-                for ext in ("*.whl", "*.egg"):
-                    matches = sorted(dist_dir.glob(ext))
-                    if matches:
-                        self._carla_egg = str(matches[0])
-                        break
+        while self._world is None:
+            try:
+                self._connect()
+            except Exception:
+                logger.exception("Failed to connect to CARLA, retrying in 2 seconds...")
+                time.sleep(2)
+                continue
+            break
+        print("CARLA service initialized")
 
-        if self._carla_egg:
-            entries.append(str(self._carla_egg))
+        # init
 
-        for entry in entries:
-            if entry and entry not in sys.path:
-                sys.path.insert(0, entry)
+        # reset
 
-        try:
-            import carla  # type: ignore
-            from agents.navigation.behavior_agent import (  # type: ignore
-                BehaviorAgent,
+    def _connect(self):
+        if self._world is None:
+            print("Connecting to CARLA...")
+            self._client = carla.Client(
+                os.environ.get("CARLA_HOST", "localhost"),
+                int(os.environ.get("CARLA_PORT", 2000)),
             )
-            from agents.navigation.basic_agent import BasicAgent  # type: ignore
-            from agents.navigation.constant_velocity_agent import (  # type: ignore
-                ConstantVelocityAgent,
-            )
-        except Exception as e:
-            raise RuntimeError("CARLA Python API/agents not available") from e
-
-        self._carla = carla
-        self._BehaviorAgent = BehaviorAgent
-        self._BasicAgent = BasicAgent
-        self._ConstantVelocityAgent = ConstantVelocityAgent
-
-    def _connect(self) -> None:
-        self._ensure_carla_imports()
-        if self._client is not None:
-            return
-        logger.info("Connecting to CARLA server at %s:%s...", self._host, self._port)
-        client = self._carla.Client(self._host, self._port)
-        # Temporarily set a short timeout for the initial connection attempt
-        client.set_timeout(2.0)
-        world = client.get_world()
-        if world is None:
-            raise RuntimeError("Failed to connect to CARLA server")
-        self._client = client
-        self._client.set_timeout(self._timeout)
-        logger.info("Connected to CARLA server at %s:%s", self._host, self._port)
+            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
+            self._world = self._client.get_world()
+            setting = self._world.get_settings()
+            setting.no_rendering_mode = True
+            setting.synchronous_mode = True
+            self._world.apply_settings(setting)
+            print("Connected to CARLA")
+        print(f"Carla version: {self._client.get_server_version()}")
 
     def _find_ego_vehicle_once(self):
         if self._world is None:
@@ -230,21 +194,37 @@ class CarlaAgentAV:
             agent.ignore_vehicles(self._ignore_vehicles)
         return agent
 
-    def init(self, sps: ScenarioPack) -> None:
-        self._sps = sps
-        for i in range(self._max_retry_times):
-            logger.info("Initializing CARLA world (attempt %d)...", i + 1)
-            try:
-                self._connect()
-                break
-            except Exception:
-                logger.exception("Failed to initialize CARLA world (attempt %d)", i + 1)
-                if i == self._max_retry_times - 1:
-                    raise RuntimeError(
-                        "Exceeded maximum retry attempts for CARLA connection"
-                    )
-                time.sleep(1.0)
-        logger.info("CarlaAgentAV initialized.")
+    def init(self, cfg: dict, output_dir: str, map_name: str) -> None:
+        self._output_dir = Path(output_dir)
+        self.config = cfg or {}
+
+        self._carla_root = self.config.get("carla_root") or os.environ.get("CARLA_ROOT")
+        self._carla_egg = self.config.get("carla_egg")
+        self._sync = bool(self.config.get("sync", True))
+        self._no_rendering = bool(self.config.get("no_rendering", True))
+        self._fixed_delta_seconds = self.config.get("fixed_delta_seconds", 0.05)
+
+        self._ego_role_name = self.config.get("ego_role_name", "hero")
+        self._ego_bp_id = self.config.get("ego_bp_id", "vehicle.tesla.model3")
+        self._agent_type = str(self.config.get("agent_type", "behavior")).lower()
+        self._behavior = str(self.config.get("behavior", "normal")).lower()
+        self._random_destination = bool(self.config.get("random_destination", False))
+        self._follow_speed_limits = bool(self.config.get("follow_speed_limits", False))
+        self._ignore_traffic_lights = bool(
+            self.config.get("ignore_traffic_lights", False)
+        )
+        self._ignore_stop_signs = bool(self.config.get("ignore_stop_signs", False))
+        self._ignore_vehicles = bool(self.config.get("ignore_vehicles", False))
+
+        self._target_speed = self.config.get("target_speed", None)
+        self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
+
+        self._yaw_sign = float(self.config.get("yaw_sign", -1.0))
+        self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
+        self._max_wait_sec = float(self.config.get("max_wait_sec", 10.0))
+        self._spawn_z_offset = float(self.config.get("spawn_z_offset", 3.0))
+        self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
+        self._max_retry_times = int(self.config.get("max_retry_times", 10))
 
     def reset(
         self,
@@ -278,7 +258,7 @@ class CarlaAgentAV:
                 raise RuntimeError("No spawn points available for random destination")
             dest = random.choice(spawn_points).location
         else:
-            goal_pos = self._get_goal_position(sps)
+            goal_pos = sps.ego.goal_config.position if sps is not None else None
             if goal_pos is None:
                 if self._map is None:
                     raise RuntimeError(
@@ -296,7 +276,6 @@ class CarlaAgentAV:
             else:
                 dest = self._to_carla_location(goal_pos)
         dest.z += self._spawn_z_offset  # to avoid underground issues
-        import carla
 
         end_wp = self._map.get_waypoint(dest, project_to_road=True)
         print(
@@ -413,8 +392,6 @@ class CarlaAgentAV:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
     def _ensure_world(self, sps: Optional[ScenarioPack]) -> None:
-        if self._world:
-            return
         opendrive_path = None
         carla_map_name = None
         if sps is not None:
@@ -475,21 +452,6 @@ class CarlaAgentAV:
         )
         if self._original_settings is None:
             self._original_settings = world.get_settings()
-
-    def _get_goal_position(self, sps: Optional[ScenarioPack]):
-        if sps is None:
-            return None
-        ego = getattr(sps, "ego", None)
-        if ego is None:
-            return None
-        for attr in ("goal_config", "goal"):
-            cfg = getattr(ego, attr, None)
-            if cfg is None:
-                continue
-            pos = getattr(cfg, "position", None)
-            if pos is not None:
-                return pos
-        return getattr(ego, "goal_position", None)
 
     def _get_spawn_position(
         self, init_obs: Optional[list[ObjectState]], sps: Optional[ScenarioPack]

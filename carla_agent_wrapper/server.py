@@ -23,31 +23,20 @@ logging.basicConfig(
 class AVServer(av_server_pb2_grpc.AvServerServicer):
     def __init__(self):
         super().__init__()
-        self._av = None
+        self._av = CarlaAgentAV()
 
     def Ping(self, request, context):
         logger.info(f"Received ping from client: {context.peer()}")
         return Pong(msg="CARLA-Agent alive")
 
     def Init(self, request, context):
-        output_dir = request.output_dir.path
         config = MessageToDict(request.config.config)
-        scenario_pack = request.scenario_pack
-        print("output_dir:", output_dir)
-        print("config:", config)
+        output_dir = request.output_dir.path
+        map_name = request.map_name
+        pprint(config)
 
-        if self._av is not None:
-            try:
-                logger.info("Init called while AV exists; stopping previous instance.")
-                self._av.stop()
-            except Exception:
-                logger.exception("Failed to stop previous AV instance on Init")
-            finally:
-                self._av = None
-
-        self._av = CarlaAgentAV(output_dir, config)
         try:
-            self._av.init(scenario_pack)
+            self._av.init(config, output_dir, map_name)
             return av_server_pb2.AvServerMessages.InitResponse(
                 success=True, msg="Initialization successful"
             )

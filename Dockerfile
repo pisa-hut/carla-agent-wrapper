@@ -37,6 +37,5 @@ ENV PORT=50051
 ENV CARLA_PORT=2000
 ENV CARLA_TIMEOUT=5
 
-
 ENTRYPOINT [ "/bin/bash" ]
 CMD [ "/app/entrypoint.sh" ]
