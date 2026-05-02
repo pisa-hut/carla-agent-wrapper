@@ -53,15 +53,18 @@ class CarlaAgentAV:
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
-        # File handles are intentionally leaked here — they need to outlive
-        # this scope so the long-running CARLA subprocess can keep writing.
-        # SIM115 wants `with open(...)` which would close the file before
-        # the subprocess emits anything.
-        subprocess.Popen(  # noqa: SIM115
-            ["/app/carla_server.sh"],
-            stdout=open(f"{self._server_log_path}/stdout.log", "w"),  # noqa: SIM115
-            stderr=open(f"{self._server_log_path}/stderr.log", "w"),  # noqa: SIM115
-        )
+        # subprocess.Popen dups these descriptors into the child, so it's
+        # safe to close the parent handles after Popen returns — the
+        # CARLA process keeps writing through its own fds.
+        with (
+            open(f"{self._server_log_path}/stdout.log", "w") as out,
+            open(f"{self._server_log_path}/stderr.log", "w") as err,
+        ):
+            subprocess.Popen(
+                ["/app/carla_server.sh"],
+                stdout=out,
+                stderr=err,
+            )
 
         while self._server_version is None:
             try:
@@ -390,21 +393,28 @@ class CarlaAgentAV:
             # read opendrive file
             with open(opendrive_path, encoding="utf-8") as f:
                 opendrive_str = f.read()
+            # OpenDRIVE world generation can take minutes — bump the
+            # client timeout, but guarantee it gets restored even if
+            # generation raises (otherwise every subsequent CARLA call
+            # on this client inherits the inflated 300s timeout).
+            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
             self._client.set_timeout(300.0)
-            logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
-            world = self._client.generate_opendrive_world(
-                opendrive_str,
-                carla.OpendriveGenerationParameters(
-                    vertex_distance=2.0,
-                    max_road_length=500.0,
-                    wall_height=0.0,
-                    additional_width=0.6,
-                    smooth_junctions=True,
-                    enable_mesh_visibility=True,
-                ),
-            )
-            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
-            logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
+            try:
+                logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
+                world = self._client.generate_opendrive_world(
+                    opendrive_str,
+                    carla.OpendriveGenerationParameters(
+                        vertex_distance=2.0,
+                        max_road_length=500.0,
+                        wall_height=0.0,
+                        additional_width=0.6,
+                        smooth_junctions=True,
+                        enable_mesh_visibility=True,
+                    ),
+                )
+                logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
+            finally:
+                self._client.set_timeout(default_timeout)
         else:
             raise RuntimeError("Cannot determine CARLA world to load")
 
@@ -528,10 +538,14 @@ class CarlaAgentAV:
             return
 
         if self._vehicle is None:
+            # Auto-spawn is currently disabled (the `_spawn_ego` call
+            # below is intentionally unreachable while the obs-based
+            # spawn path is in flight). Surface a clear configuration
+            # error rather than continuing with `_vehicle is None`.
             raise RuntimeError(
-                "Removing sps parameter from _spawn_ego, using init_obs instead. If you see this error, it means the ego vehicle was not found and auto-spawn is disabled. Please check your configuration and ensure that the ego vehicle is properly defined in the scenario pack or that auto-spawn is enabled."
+                "Ego vehicle not found in scenario pack and auto-spawn is disabled. "
+                "Define the ego in the scenario pack or enable auto-spawn."
             )
-            self._vehicle = self._spawn_ego(obs, self._sps)
 
         ego_state = obs[0].kinematic
         apply_kinematic(self._vehicle, ego_state)
