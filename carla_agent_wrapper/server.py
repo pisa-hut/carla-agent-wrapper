@@ -1,15 +1,13 @@
+import logging
 import os
 from concurrent import futures
+
 import grpc
-from google.protobuf.json_format import MessageToDict
-
-from pisa_api import av_server_pb2, av_server_pb2_grpc
-from pisa_api.pong_pb2 import Pong
-from pisa_api.empty_pb2 import Empty
-
 from carla_agent import CarlaAgentAV
-
-import logging
+from google.protobuf.json_format import MessageToDict
+from pisa_api import av_server_pb2, av_server_pb2_grpc
+from pisa_api.empty_pb2 import Empty
+from pisa_api.pong_pb2 import Pong
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -69,9 +67,7 @@ class AVServer(av_server_pb2_grpc.AvServerServicer):
 
     def ShouldQuit(self, request, context):
         should_quit = self._av.should_quit()
-        return av_server_pb2.AvServerMessages.ShouldQuitResponse(
-            should_quit=should_quit
-        )
+        return av_server_pb2.AvServerMessages.ShouldQuitResponse(should_quit=should_quit)
 
 
 def serve():
