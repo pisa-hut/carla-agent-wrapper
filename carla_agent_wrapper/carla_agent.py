@@ -1,25 +1,20 @@
-import subprocess
+import contextlib
 import logging
 import math
 import os
 import random
-import sys
+import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-
+import carla
+from agents.navigation.basic_agent import BasicAgent
+from agents.navigation.behavior_agent import BehaviorAgent
+from agents.navigation.constant_velocity_agent import ConstantVelocityAgent
 from pisa_api.control_pb2 import CtrlCmd, CtrlMode
 from pisa_api.object_pb2 import ObjectState, RoadObjectType
 from pisa_api.scenario_pb2 import ScenarioPack
-
-import carla
-
-from agents.navigation.behavior_agent import BehaviorAgent
-from agents.navigation.basic_agent import BasicAgent
-from agents.navigation.constant_velocity_agent import ConstantVelocityAgent
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -52,23 +47,26 @@ class CarlaAgentAV:
         self._spawned_actor_ids = set()
 
         self._client = None
-        self._world = None
-        self._map = None
-        self._vehicle = None
-        self._agent = None
-        self._other_actors: list[Any] = []
-        self._other_actor_types: list[RoadObjectType] = []
+        self._server_version = None
 
-        self._sps: Optional[ScenarioPack] = None
         self._quit_flag = False
 
-        subprocess.Popen(
-            ["/app/carla_server.sh"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._server_log_path = "/mnt/output/carla_server"
+        os.makedirs(self._server_log_path, exist_ok=True)
+        # subprocess.Popen dups these descriptors into the child, so it's
+        # safe to close the parent handles after Popen returns — the
+        # CARLA process keeps writing through its own fds.
+        with (
+            open(f"{self._server_log_path}/stdout.log", "w") as out,
+            open(f"{self._server_log_path}/stderr.log", "w") as err,
+        ):
+            subprocess.Popen(
+                ["/app/carla_server.sh"],
+                stdout=out,
+                stderr=err,
+            )
 
-        while self._world is None:
+        while self._server_version is None:
             try:
                 self._connect()
             except Exception:
@@ -76,27 +74,29 @@ class CarlaAgentAV:
                 time.sleep(2)
                 continue
             break
+        time.sleep(2)  # wait a bit for the server to be fully ready
         print("CARLA service initialized")
 
-        # init
-
         # reset
+        self._world = None
+        self._map = None
+        self._vehicle = None
+        self._agent = None
+        self._other_actors: list[Any] = []
+        self._other_actor_types: list[RoadObjectType] = []
 
     def _connect(self):
-        if self._world is None:
-            print("Connecting to CARLA...")
-            self._client = carla.Client(
-                os.environ.get("CARLA_HOST", "localhost"),
-                int(os.environ.get("CARLA_PORT", 2000)),
-            )
-            self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
-            self._world = self._client.get_world()
-            setting = self._world.get_settings()
-            setting.no_rendering_mode = True
-            setting.synchronous_mode = True
-            self._world.apply_settings(setting)
-            print("Connected to CARLA")
-        print(f"Carla version: {self._client.get_server_version()}")
+        if self._server_version is not None:
+            return
+        print("Connecting to CARLA...")
+        self._client = carla.Client(
+            os.environ.get("CARLA_HOST", "localhost"),
+            int(os.environ.get("CARLA_PORT", 2000)),
+        )
+        self._client.set_timeout(2)
+        self._server_version = self._client.get_server_version()
+        self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
+        print("Connected to CARLA")
 
     def _find_ego_vehicle_once(self):
         if self._world is None:
@@ -111,9 +111,7 @@ class CarlaAgentAV:
     def _wait_for_ego(self, timeout_s: float):
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            logger.info(
-                "Searching for ego vehicle with role_name=%r...", self._ego_role_name
-            )
+            logger.info("Searching for ego vehicle with role_name=%r...", self._ego_role_name)
             actor = self._find_ego_vehicle_once()
             if actor is not None:
                 return actor
@@ -171,9 +169,7 @@ class CarlaAgentAV:
             return None
 
         if self._agent_type == "behavior":
-            agent = self._BehaviorAgent(
-                self._vehicle, behavior=self._behavior, map_inst=self._map
-            )
+            agent = self._BehaviorAgent(self._vehicle, behavior=self._behavior, map_inst=self._map)
         elif self._agent_type == "basic":
             agent = self._BasicAgent(self._vehicle, map_inst=self._map)
         elif self._agent_type in ("constant_velocity", "constant-velocity"):
@@ -198,8 +194,6 @@ class CarlaAgentAV:
         self._output_dir = Path(output_dir)
         self.config = cfg or {}
 
-        self._carla_root = self.config.get("carla_root") or os.environ.get("CARLA_ROOT")
-        self._carla_egg = self.config.get("carla_egg")
         self._sync = bool(self.config.get("sync", True))
         self._no_rendering = bool(self.config.get("no_rendering", True))
         self._fixed_delta_seconds = self.config.get("fixed_delta_seconds", 0.05)
@@ -210,9 +204,7 @@ class CarlaAgentAV:
         self._behavior = str(self.config.get("behavior", "normal")).lower()
         self._random_destination = bool(self.config.get("random_destination", False))
         self._follow_speed_limits = bool(self.config.get("follow_speed_limits", False))
-        self._ignore_traffic_lights = bool(
-            self.config.get("ignore_traffic_lights", False)
-        )
+        self._ignore_traffic_lights = bool(self.config.get("ignore_traffic_lights", False))
         self._ignore_stop_signs = bool(self.config.get("ignore_stop_signs", False))
         self._ignore_vehicles = bool(self.config.get("ignore_vehicles", False))
 
@@ -221,7 +213,6 @@ class CarlaAgentAV:
 
         self._yaw_sign = float(self.config.get("yaw_sign", -1.0))
         self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
-        self._max_wait_sec = float(self.config.get("max_wait_sec", 10.0))
         self._spawn_z_offset = float(self.config.get("spawn_z_offset", 3.0))
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
         self._max_retry_times = int(self.config.get("max_retry_times", 10))
@@ -230,18 +221,18 @@ class CarlaAgentAV:
         self,
         output_dir: Path,
         sps: ScenarioPack,
-        init_obs: Optional[list[ObjectState]] = None,
+        init_obs: list[ObjectState] | None = None,
     ) -> CtrlCmd:
         self._output_dir = Path(output_dir)
         # os.makedirs(self._output_dir, exist_ok=True)
         self._sps = sps
         self._quit_flag = False
 
-        self._ensure_world(sps)
+        self._ensure_world(sps.map_name)
         self._vehicle = None
         logger.info("Ego vehicle found: %s", self._vehicle)
         if self._vehicle is None:
-            self._vehicle = self._spawn_ego(init_obs, self._sps)
+            self._vehicle = self._spawn_ego(init_obs, sps)
 
         self._apply_world_settings()
 
@@ -261,17 +252,11 @@ class CarlaAgentAV:
             goal_pos = sps.ego.goal_config.position if sps is not None else None
             if goal_pos is None:
                 if self._map is None:
-                    raise RuntimeError(
-                        "Goal position missing and CARLA map not available"
-                    )
-                logger.warning(
-                    "Goal position missing; using random destination from spawn points."
-                )
+                    raise RuntimeError("Goal position missing and CARLA map not available")
+                logger.warning("Goal position missing; using random destination from spawn points.")
                 spawn_points = self._map.get_spawn_points()
                 if not spawn_points:
-                    raise RuntimeError(
-                        "No spawn points available for destination fallback"
-                    )
+                    raise RuntimeError("No spawn points available for destination fallback")
                 dest = random.choice(spawn_points).location
             else:
                 dest = self._to_carla_location(goal_pos)
@@ -334,17 +319,17 @@ class CarlaAgentAV:
     def should_quit(self) -> bool:
         return self._quit_flag
 
-    def _spawn_ego(self, init_obs: Optional[list[ObjectState]], sps: ScenarioPack):
+    def _spawn_ego(self, init_obs: list[ObjectState] | None, sps: ScenarioPack):
         if self._world is None:
             raise RuntimeError("CARLA world not available")
 
         bp_lib = self._world.get_blueprint_library()
         try:
             ego_bp = bp_lib.find(self._ego_bp_id)
-        except Exception:
+        except Exception as exc:
             candidates = bp_lib.filter("vehicle.*")
             if not candidates:
-                raise RuntimeError("No vehicle blueprints available in CARLA")
+                raise RuntimeError("No vehicle blueprints available in CARLA") from exc
             ego_bp = candidates[0]
 
         if ego_bp.has_attribute("role_name"):
@@ -380,9 +365,7 @@ class CarlaAgentAV:
         except Exception:
             self._max_steer_rad = None
 
-        logger.info(
-            "Ego vehicle spawned at %s with yaw %.3f", carla_pos, self._extract_yaw(pos)
-        )
+        logger.info("Ego vehicle spawned at %s with yaw %.3f", carla_pos, self._extract_yaw(pos))
         return ego
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
@@ -391,71 +374,59 @@ class CarlaAgentAV:
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
-    def _ensure_world(self, sps: Optional[ScenarioPack]) -> None:
-        opendrive_path = None
+    def _ensure_world(self, map_name: str) -> None:
+        if self._server_version is None:
+            self._connect()
+
         carla_map_name = None
-        if sps is not None:
-            maps = getattr(sps, "maps", None)
-            if maps:
-                try:
-                    carla_map_name = maps.get("carla_map_name", carla_map_name)
-                except Exception:
-                    pass
-                try:
-                    opendrive_path = maps.get("xodr_path", None)
-                except Exception:
-                    opendrive_path = None
-
-            if opendrive_path is None:
-                map_name = getattr(sps, "map_name", None)
-                if map_name:
-                    opendrive_path = self._xodr_root / f"{map_name}.xodr"
-
-        if hasattr(carla_map_name, "path"):
-            carla_map_name = carla_map_name.path
-        if hasattr(opendrive_path, "path"):
-            opendrive_path = opendrive_path.path
+        opendrive_name = map_name
+        opendrive_path = Path(os.path.join(self._xodr_root, f"{opendrive_name}.xodr")).resolve()
 
         world = None
         if carla_map_name:
-            world = self._client.load_world(str(carla_map_name), reset_settings=False)
+            world = self._client.load_world(carla_map_name, reset_settings=False)
         elif opendrive_path and hasattr(self._client, "generate_opendrive_world"):
             opendrive_path = Path(opendrive_path)
             if not opendrive_path.exists():
-                logger.warning(
-                    "OpenDRIVE path not found (%s); using current world.",
-                    opendrive_path,
-                )
-            else:
-                # read opendrive file
-                with open(opendrive_path, "r", encoding="utf-8") as f:
-                    opendrive_str = f.read()
+                raise RuntimeError("OpenDRIVE path not found for CARLA world generation")
+
+            # read opendrive file
+            with open(opendrive_path, encoding="utf-8") as f:
+                opendrive_str = f.read()
+            # OpenDRIVE world generation can take minutes — bump the
+            # client timeout, but guarantee it gets restored even if
+            # generation raises (otherwise every subsequent CARLA call
+            # on this client inherits the inflated 300s timeout).
+            default_timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
+            self._client.set_timeout(300.0)
+            try:
+                logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
                 world = self._client.generate_opendrive_world(
                     opendrive_str,
-                    self._carla.OpendriveGenerationParameters(
+                    carla.OpendriveGenerationParameters(
                         vertex_distance=2.0,
-                        max_road_length=3000.0,
-                        wall_height=10.0,
+                        max_road_length=500.0,
+                        wall_height=0.0,
                         additional_width=0.6,
                         smooth_junctions=True,
                         enable_mesh_visibility=True,
                     ),
                 )
+                logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
+            finally:
+                self._client.set_timeout(default_timeout)
+        else:
+            raise RuntimeError("Cannot determine CARLA world to load")
 
         if world is None:
             world = self._client.get_world()
 
         self._world = world
-        self._map = world.get_map() if world else None
-        logger.warning(
-            "current map name :  %s", self._map.name if self._map else "None"
-        )
+        self._map = world.get_map()
         if self._original_settings is None:
             self._original_settings = world.get_settings()
 
-    def _get_spawn_position(
-        self, init_obs: Optional[list[ObjectState]], sps: Optional[ScenarioPack]
-    ):
+    def _get_spawn_position(self, init_obs: list[ObjectState] | None, sps: ScenarioPack | None):
         if init_obs:
             try:
                 return init_obs[0].kinematic
@@ -547,10 +518,8 @@ class CarlaAgentAV:
             try:
                 actor.set_target_velocity(vel)
             except Exception:
-                try:
+                with contextlib.suppress(Exception):
                     actor.set_velocity(vel)
-                except Exception:
-                    pass
 
             if abs(float(kin.yaw_rate)) > 1e-6:
                 ang_z = math.degrees(float(kin.yaw_rate)) * self._yaw_sign
@@ -558,10 +527,8 @@ class CarlaAgentAV:
                 try:
                     actor.set_target_angular_velocity(ang)
                 except Exception:
-                    try:
+                    with contextlib.suppress(Exception):
                         actor.set_angular_velocity(ang)
-                    except Exception:
-                        pass
 
         if not obs:
             if self._sync:
@@ -571,7 +538,14 @@ class CarlaAgentAV:
             return
 
         if self._vehicle is None:
-            self._vehicle = self._spawn_ego(obs, self._sps)
+            # Auto-spawn is currently disabled (the `_spawn_ego` call
+            # below is intentionally unreachable while the obs-based
+            # spawn path is in flight). Surface a clear configuration
+            # error rather than continuing with `_vehicle is None`.
+            raise RuntimeError(
+                "Ego vehicle not found in scenario pack and auto-spawn is disabled. "
+                "Define the ego in the scenario pack or enable auto-spawn."
+            )
 
         ego_state = obs[0].kinematic
         apply_kinematic(self._vehicle, ego_state)
