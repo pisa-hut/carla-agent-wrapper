@@ -12,9 +12,19 @@ import carla
 from agents.navigation.basic_agent import BasicAgent
 from agents.navigation.behavior_agent import BehaviorAgent
 from agents.navigation.constant_velocity_agent import ConstantVelocityAgent
-from pisa_api.control_pb2 import CtrlCmd, CtrlMode
-from pisa_api.object_pb2 import ObjectState, RoadObjectType
-from pisa_api.scenario_pb2 import ScenarioPack
+from pisa_api.av import (
+    ControlCommand,
+    ControlMode,
+    InitRequest,
+    InitResponse,
+    ObjectStateData,
+    ResetRequest,
+    ResetResponse,
+    RoadObjectType,
+    ScenarioPackData,
+    StepRequest,
+    StepResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +40,11 @@ class CarlaAgentAV:
     CARLA automatic-control style AV adapter.
     - init(): connect to CARLA, prepare agent classes
     - reset(): find ego by role_name, create agent, set destination/speed
-    - step(): run agent.run_step(), convert to CtrlCmd
+    - step(): run agent.run_step(), convert to ControlCommand
     """
 
     def __init__(self):
+        print("hello from CarlaAgentAV __init__")
         self._carla = carla
         self._BehaviorAgent = BehaviorAgent
         self._BasicAgent = BasicAgent
@@ -120,15 +131,19 @@ class CarlaAgentAV:
 
     def _extract_xyz(self, pos) -> tuple[float, float, float]:
         if pos is None:
-            return 0.0, 0.0, 0.0
+            raise ValueError("Position is None")
         world = getattr(pos, "world", None)
-        if world is not None and hasattr(world, "x"):
-            return float(world.x), float(world.y), float(world.z)
-        return (
-            float(getattr(pos, "x", 0.0)),
-            float(getattr(pos, "y", 0.0)),
-            float(getattr(pos, "z", 0.0)),
-        )
+        source = world if world is not None else pos
+        missing = [name for name in ("x", "y", "z") if not hasattr(source, name)]
+        if missing:
+            raise ValueError(
+                f"Position object is missing coordinate field(s): {', '.join(missing)}. "
+                f"position={pos!r}"
+            )
+        try:
+            return float(source.x), float(source.y), float(source.z)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Failed to convert position coordinates to float: {pos!r}") from exc
 
     def _extract_yaw(self, pos) -> float:
         if pos is None:
@@ -143,7 +158,10 @@ class CarlaAgentAV:
         return 0.0
 
     def _to_carla_location(self, pos) -> Any:
-        x, y, z = self._extract_xyz(pos)
+        try:
+            x, y, z = self._extract_xyz(pos)
+        except Exception as exc:
+            raise ValueError(f"Failed to convert position to CARLA location: {pos!r}") from exc
         y = float(y) * self._yaw_sign
         return self._carla.Location(
             x=float(x),
@@ -151,7 +169,7 @@ class CarlaAgentAV:
             z=float(z),
         )
 
-    def _get_target_speed_kmh(self, sps: ScenarioPack) -> float:
+    def _get_target_speed_kmh(self, sps: ScenarioPackData) -> float:
         speed = self._target_speed
         if speed is None and sps is not None:
             ego = getattr(sps, "ego", None)
@@ -177,7 +195,7 @@ class CarlaAgentAV:
                 self._vehicle, target_speed=target_speed_kmh, map_inst=self._map
             )
         else:
-            raise ValueError(f"Unsupported agent_type: {self._agent_type}")
+            raise ValueError(f"Unsupported CARLA agent_type: {self._agent_type!r}")
 
         agent.set_target_speed(target_speed_kmh)
         if hasattr(agent, "follow_speed_limits"):
@@ -190,13 +208,13 @@ class CarlaAgentAV:
             agent.ignore_vehicles(self._ignore_vehicles)
         return agent
 
-    def init(self, cfg: dict, output_dir: str, map_name: str) -> None:
-        self._output_dir = Path(output_dir)
-        self.config = cfg or {}
+    def init(self, request: InitRequest) -> InitResponse | None:
+        self._output_dir = request.output_dir
+        self.config = request.config or {}
+        self._fixed_delta_seconds = request.dt
 
         self._sync = bool(self.config.get("sync", True))
         self._no_rendering = bool(self.config.get("no_rendering", True))
-        self._fixed_delta_seconds = self.config.get("fixed_delta_seconds", 0.05)
 
         self._ego_role_name = self.config.get("ego_role_name", "hero")
         self._ego_bp_id = self.config.get("ego_bp_id", "vehicle.tesla.model3")
@@ -219,12 +237,12 @@ class CarlaAgentAV:
 
     def reset(
         self,
-        output_dir: Path,
-        sps: ScenarioPack,
-        init_obs: list[ObjectState] | None = None,
-    ) -> CtrlCmd:
-        self._output_dir = Path(output_dir)
+        request: ResetRequest,
+    ) -> ControlCommand | ResetResponse:
+        self._output_dir = request.output_dir
         # os.makedirs(self._output_dir, exist_ok=True)
+        sps = request.scenario_pack
+        init_obs = request.initial_observation
         self._sps = sps
         self._quit_flag = False
 
@@ -262,24 +280,37 @@ class CarlaAgentAV:
                 dest = self._to_carla_location(goal_pos)
         dest.z += self._spawn_z_offset  # to avoid underground issues
 
-        end_wp = self._map.get_waypoint(dest, project_to_road=True)
-        print(
-            "Start:",
-            self._vehicle.get_transform().location,
-            "Yaw:",
-            self._from_carla_yaw(self._vehicle.get_transform().rotation.yaw),
+        start_transform = self._vehicle.get_transform()
+        start_wp = self._snap_to_waypoint(start_transform.location, "ego start")
+        end_wp = self._snap_to_waypoint(dest, "destination")
+        logger.info(
+            "Route start: %s, yaw: %.3f, snapped to: %s",
+            start_transform.location,
+            self._from_carla_yaw(start_transform.rotation.yaw),
+            start_wp.transform.location,
         )
-        print("Destination:", dest, "Snapped to:", end_wp.transform.location)
-        print("==============================================")
-        self._agent.set_destination(end_wp.transform.location)
-
-        return self.step(
-            obs=init_obs if init_obs is not None else [],
-            time_stamp_ns=0,
+        logger.info(
+            "Route destination: %s, snapped to: %s",
+            dest,
+            end_wp.transform.location,
         )
+        try:
+            self._agent.set_destination(end_wp.transform.location, start_wp.transform.location)
+        except Exception as exc:
+            raise RuntimeError(
+                f"CARLA agent_type={self._agent_type!r} failed to plan a route. "
+                f"start={self._format_waypoint(start_wp)}, "
+                f"destination={self._format_waypoint(end_wp)}"
+            ) from exc
 
-    def step(self, obs: list[ObjectState], time_stamp_ns: int) -> CtrlCmd:
+        return self.step(StepRequest(observation=init_obs if init_obs is not None else []))
+
+    def step(self, request: StepRequest) -> ControlCommand | StepResponse:
+        obs = request.observation
         self._update_and_tick(obs)
+        if self._agent is None:
+            raise RuntimeError("CARLA agent is not initialized")
+
         control = self._agent.run_step()
         if hasattr(self._agent, "done") and self._agent.done():
             self._quit_flag = True
@@ -287,8 +318,8 @@ class CarlaAgentAV:
         yaw_sign = self._yaw_sign if abs(self._yaw_sign) > 1e-6 else 1.0
         steer_sv = float(control.steer) / yaw_sign
 
-        return CtrlCmd(
-            mode=CtrlMode.THROTTLE_STEER_BREAK,
+        return ControlCommand(
+            mode=ControlMode.THROTTLE_STEER_BREAK,
             payload={
                 "throttle": float(control.throttle),
                 "brake": float(control.brake),
@@ -319,7 +350,7 @@ class CarlaAgentAV:
     def should_quit(self) -> bool:
         return self._quit_flag
 
-    def _spawn_ego(self, init_obs: list[ObjectState] | None, sps: ScenarioPack):
+    def _spawn_ego(self, init_obs: list[ObjectStateData] | None, sps: ScenarioPackData):
         if self._world is None:
             raise RuntimeError("CARLA world not available")
 
@@ -374,6 +405,22 @@ class CarlaAgentAV:
     def _from_carla_yaw(self, yaw_deg: float) -> float:
         return math.radians((yaw_deg - self._yaw_offset_deg) * self._yaw_sign)
 
+    def _snap_to_waypoint(self, location, label: str):
+        if self._map is None:
+            raise RuntimeError("CARLA map not available for route planning")
+        waypoint = self._map.get_waypoint(location, project_to_road=True)
+        if waypoint is None:
+            raise RuntimeError(f"Failed to project {label} location onto CARLA map: {location}")
+        return waypoint
+
+    def _format_waypoint(self, waypoint) -> str:
+        loc = waypoint.transform.location
+        return (
+            f"road_id={waypoint.road_id}, section_id={waypoint.section_id}, "
+            f"lane_id={waypoint.lane_id}, s={waypoint.s:.3f}, "
+            f"location=({loc.x:.3f}, {loc.y:.3f}, {loc.z:.3f})"
+        )
+
     def _ensure_world(self, map_name: str) -> None:
         if self._server_version is None:
             self._connect()
@@ -405,7 +452,7 @@ class CarlaAgentAV:
                     opendrive_str,
                     carla.OpendriveGenerationParameters(
                         vertex_distance=2.0,
-                        max_road_length=500.0,
+                        max_road_length=3000.0,
                         wall_height=0.0,
                         additional_width=0.6,
                         smooth_junctions=True,
@@ -426,7 +473,11 @@ class CarlaAgentAV:
         if self._original_settings is None:
             self._original_settings = world.get_settings()
 
-    def _get_spawn_position(self, init_obs: list[ObjectState] | None, sps: ScenarioPack | None):
+    def _get_spawn_position(
+        self,
+        init_obs: list[ObjectStateData] | None,
+        sps: ScenarioPackData | None,
+    ):
         if init_obs:
             try:
                 return init_obs[0].kinematic
@@ -459,7 +510,7 @@ class CarlaAgentAV:
             settings.fixed_delta_seconds = float(self._fixed_delta_seconds)
         self._world.apply_settings(settings)
 
-    def _update_and_tick(self, obs: list[ObjectState]) -> None:
+    def _update_and_tick(self, obs: list[ObjectStateData]) -> None:
         if self._world is None:
             return
 
