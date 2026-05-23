@@ -59,6 +59,56 @@ class _FakeWorld:
         return None
 
 
+class _FakeBlueprint:
+    def __init__(self):
+        self.attributes = {}
+
+    def has_attribute(self, name):
+        return name == "role_name"
+
+    def set_attribute(self, name, value):
+        self.attributes[name] = value
+
+
+class _FakeBlueprintLibrary:
+    def __init__(self, *, find_results=None, filter_results=None):
+        self.find_results = dict(find_results or {})
+        self.filter_results = dict(filter_results or {})
+        self.find_calls = []
+        self.filter_calls = []
+
+    def find(self, pattern):
+        self.find_calls.append(pattern)
+        result = self.find_results.get(pattern)
+        if result is None:
+            raise KeyError(pattern)
+        return result
+
+    def filter(self, pattern):
+        self.filter_calls.append(pattern)
+        return list(self.filter_results.get(pattern, []))
+
+
+class _FakeActorWorld(_FakeWorld):
+    def __init__(self, blueprints):
+        super().__init__([])
+        self.blueprints = blueprints
+        self.spawned = []
+        self.tick_calls = 0
+
+    def get_blueprint_library(self):
+        return self.blueprints
+
+    def try_spawn_actor(self, blueprint, transform):
+        actor = _FakeMovingActor(actor_id=len(self.spawned) + 10)
+        self.spawned.append((actor, blueprint, transform))
+        self.actors.append(actor)
+        return actor
+
+    def tick(self):
+        self.tick_calls += 1
+
+
 class _FakeActor:
     def __init__(self, actor_id, type_id="vehicle.test"):
         self.id = actor_id
@@ -67,6 +117,27 @@ class _FakeActor:
 
     def destroy(self):
         self.destroy_calls += 1
+
+
+class _DestroyFalseActor(_FakeActor):
+    def destroy(self):
+        self.destroy_calls += 1
+        return False
+
+
+class _FakeMovingActor(_FakeActor):
+    def __init__(self, actor_id, type_id="vehicle.test"):
+        super().__init__(actor_id, type_id)
+        self.transforms = []
+
+    def set_transform(self, transform):
+        self.transforms.append(transform)
+
+    def set_target_velocity(self, velocity):
+        self.velocity = velocity
+
+    def set_target_angular_velocity(self, velocity):
+        self.angular_velocity = velocity
 
 
 class _FakeAgent:
@@ -143,6 +214,15 @@ def test_clear_dynamic_actors_only_destroys_runtime_actor_types() -> None:
     assert static_prop.destroy_calls == 0
 
 
+def test_destroy_actor_treats_false_return_as_failure() -> None:
+    from carla_agent_wrapper.lifecycle import destroy_actor
+
+    actor = _DestroyFalseActor(actor_id=1)
+
+    assert destroy_actor(actor) is False
+    assert actor.destroy_calls == 1
+
+
 def test_reset_finalizes_previous_run_and_partial_state_on_failure(carla_agent_module) -> None:
     adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
     calls = []
@@ -162,6 +242,16 @@ def test_reset_finalizes_previous_run_and_partial_state_on_failure(carla_agent_m
     assert calls == ["finalize", "finalize"]
 
 
+def test_init_rejects_invalid_behavior(carla_agent_module) -> None:
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    adapter._finalized = True
+
+    request = SimpleNamespace(output_dir="out", config={"behavior": "fast"}, dt=0.05)
+
+    with pytest.raises(ValueError, match="Unsupported CARLA behavior"):
+        adapter.init(request)
+
+
 def test_ensure_world_reuses_cached_opendrive_world(carla_agent_module, tmp_path) -> None:
     adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
     world = _FakeWorld()
@@ -178,6 +268,106 @@ def test_ensure_world_reuses_cached_opendrive_world(carla_agent_module, tmp_path
 
     assert adapter._world is world
     assert adapter._client.generated is False
+
+
+def test_blueprint_lookup_falls_back_to_filter(carla_agent_module) -> None:
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    fallback_bp = _FakeBlueprint()
+    bp_lib = _FakeBlueprintLibrary(filter_results={"vehicle.*bus*": [fallback_bp]})
+    adapter._world = SimpleNamespace(get_blueprint_library=lambda: bp_lib)
+
+    bp = adapter._pick_blueprint(carla_agent_module.RoadObjectType.BUS)
+
+    assert bp is fallback_bp
+    assert bp_lib.find_calls == ["vehicle.mitsubishi.fusorosa"]
+    assert bp_lib.filter_calls == ["vehicle.*bus*"]
+
+
+def _make_tracking_adapter(carla_agent_module):
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    bp = _FakeBlueprint()
+    world = _FakeActorWorld(_FakeBlueprintLibrary(filter_results={"vehicle.*": [bp]}))
+    adapter._world = world
+    adapter._carla = SimpleNamespace(
+        Location=lambda x, y, z: SimpleNamespace(x=x, y=y, z=z),
+        Rotation=lambda pitch, yaw, roll: SimpleNamespace(pitch=pitch, yaw=yaw, roll=roll),
+        Transform=lambda location, rotation: SimpleNamespace(location=location, rotation=rotation),
+        Vector3D=lambda x, y, z: SimpleNamespace(x=x, y=y, z=z),
+    )
+    adapter._vehicle = _FakeMovingActor(actor_id=1)
+    adapter._sync = True
+    adapter._spawn_z_offset = 0.0
+    adapter._coordinate_y_sign = 1.0
+    adapter._yaw_sign = 1.0
+    adapter._yaw_offset_deg = 0.0
+    adapter._spawned_actor_ids = set()
+    adapter._other_actors = []
+    adapter._other_actor_types = []
+    adapter._other_actors_by_key = {}
+    adapter._other_actor_types_by_key = {}
+    return adapter, world
+
+
+def _kinematic(x):
+    return SimpleNamespace(x=x, y=0.0, z=0.0, yaw=0.0, speed=0.0, yaw_rate=0.0)
+
+
+def test_index_identity_mode_reuses_actors_when_order_is_stable(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "index"
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+    obj_a = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+    obj_b = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(2.0))
+
+    adapter._update_and_tick([ego, obj_a, obj_b])
+    first_actors = dict(adapter._other_actors_by_key)
+    adapter._update_and_tick([ego, obj_a, obj_b])
+
+    assert len(world.spawned) == 2
+    assert adapter._other_actors_by_key == first_actors
+
+
+def test_provided_identity_mode_uses_stable_identity_when_order_changes(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "provided"
+
+    def kin(x):
+        return _kinematic(x)
+
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=kin(0.0))
+    obj_a = SimpleNamespace(id="a", type=carla_agent_module.RoadObjectType.CAR, kinematic=kin(1.0))
+    obj_b = SimpleNamespace(id="b", type=carla_agent_module.RoadObjectType.CAR, kinematic=kin(2.0))
+
+    adapter._update_and_tick([ego, obj_a, obj_b])
+    first_actors = dict(adapter._other_actors_by_key)
+    adapter._update_and_tick([ego, obj_b, obj_a])
+
+    assert len(world.spawned) == 2
+    assert adapter._other_actors_by_key == first_actors
+
+
+def test_stateless_identity_mode_recreates_actors_each_step(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "stateless"
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+
+    adapter._update_and_tick([ego, obj])
+    first_actor = adapter._other_actors_by_key[("frame", 0)]
+    adapter._update_and_tick([ego, obj])
+
+    assert len(world.spawned) == 2
+    assert adapter._other_actors_by_key[("frame", 0)] is not first_actor
+
+
+def test_provided_identity_mode_requires_object_id(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "provided"
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+
+    with pytest.raises(RuntimeError, match="object_identity_mode='provided'"):
+        adapter._update_and_tick([ego, obj])
 
 
 def test_destroy_spawned_actors_handles_none_and_clears_state(carla_agent_module) -> None:

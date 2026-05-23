@@ -33,11 +33,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+VALID_BEHAVIORS = {"cautious", "normal", "aggressive"}
+VALID_AGENT_TYPES = {"behavior", "basic", "constant_velocity", "constant-velocity"}
+
+OBJECT_IDENTITY_ATTRS = ("id", "object_id", "track_id", "external_id", "name")
+OBJECT_IDENTITY_MODES = {"index", "provided", "stateless"}
+
+BLUEPRINT_CANDIDATES = {
+    RoadObjectType.PEDESTRIAN: ("walker.pedestrian.0001", "walker.pedestrian.*", "walker.*"),
+    RoadObjectType.BUS: ("vehicle.mitsubishi.fusorosa", "vehicle.*bus*", "vehicle.*"),
+    RoadObjectType.TRUCK: ("vehicle.carlamotors.carlacola", "vehicle.*truck*", "vehicle.*"),
+    RoadObjectType.SEMITRAILER: ("vehicle.carlamotors.carlacola", "vehicle.*truck*", "vehicle.*"),
+    RoadObjectType.TRAILER: ("vehicle.carlamotors.firetruck", "vehicle.*truck*", "vehicle.*"),
+    RoadObjectType.VAN: ("vehicle.mercedes.sprinter", "vehicle.*van*", "vehicle.*"),
+    RoadObjectType.MOTORCYCLE: ("vehicle.vespa.zx125", "vehicle.*", "vehicle.*"),
+    RoadObjectType.BICYCLE: ("vehicle.bh.crossbike", "vehicle.*bike*", "vehicle.*"),
+    RoadObjectType.TRAIN: ("vehicle.*",),
+    RoadObjectType.TRAM: ("vehicle.*",),
+    RoadObjectType.WHEEL_CHAIR: ("walker.pedestrian.*", "walker.*"),
+    RoadObjectType.ANIMAL: ("walker.pedestrian.*", "walker.*"),
+    RoadObjectType.CAR: ("vehicle.*",),
+    RoadObjectType.UNKNOWN: ("vehicle.*",),
+}
 
 
 class CarlaAgentAV:
@@ -88,6 +105,8 @@ class CarlaAgentAV:
         self._agent = None
         self._other_actors: list[Any] = []
         self._other_actor_types: list[RoadObjectType] = []
+        self._other_actors_by_key: dict[Any, Any] = {}
+        self._other_actor_types_by_key: dict[Any, RoadObjectType] = {}
 
     def _connect(self, timeout: float = 2.0):
         if self._server_version is not None:
@@ -129,26 +148,6 @@ class CarlaAgentAV:
 
         return True
 
-    def _find_ego_vehicle_once(self):
-        if self._world is None:
-            return None
-        actors = self._world.get_actors().filter("vehicle.*")
-        for actor in actors:
-            role = actor.attributes.get("role_name", "")
-            if role == self._ego_role_name:
-                return actor
-        return None
-
-    def _wait_for_ego(self, timeout_s: float):
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            logger.info("Searching for ego vehicle with role_name=%r...", self._ego_role_name)
-            actor = self._find_ego_vehicle_once()
-            if actor is not None:
-                return actor
-            time.sleep(0.05)
-        return None
-
     def _extract_xyz(self, pos) -> tuple[float, float, float]:
         if pos is None:
             raise ValueError("Position is None")
@@ -182,7 +181,7 @@ class CarlaAgentAV:
             x, y, z = self._extract_xyz(pos)
         except Exception as exc:
             raise ValueError(f"Failed to convert position to CARLA location: {pos!r}") from exc
-        y = float(y) * self._yaw_sign
+        y = float(y) * self._coordinate_y_sign
         return self._carla.Location(
             x=float(x),
             y=y,
@@ -201,6 +200,21 @@ class CarlaAgentAV:
         if self._target_speed_is_mps:
             speed = speed * 3.6
         return speed
+
+    def _validate_config(self) -> None:
+        if self._agent_type not in VALID_AGENT_TYPES:
+            raise ValueError(f"Unsupported CARLA agent_type: {self._agent_type!r}")
+        if self._agent_type == "behavior" and self._behavior not in VALID_BEHAVIORS:
+            raise ValueError(
+                f"Unsupported CARLA behavior: {self._behavior!r}. "
+                f"Expected one of: {', '.join(sorted(VALID_BEHAVIORS))}"
+            )
+
+    def _config_sign(self, name: str, default: float) -> float:
+        value = float(self.config.get(name, default))
+        if abs(value) < 1e-6:
+            raise ValueError(f"{name} must be non-zero")
+        return 1.0 if value > 0 else -1.0
 
     def _build_agent(self, target_speed_kmh: float):
         if self._vehicle is None:
@@ -243,6 +257,7 @@ class CarlaAgentAV:
         self._ego_bp_id = self.config.get("ego_bp_id", "vehicle.tesla.model3")
         self._agent_type = str(self.config.get("agent_type", "behavior")).lower()
         self._behavior = str(self.config.get("behavior", "normal")).lower()
+        self._validate_config()
         self._random_destination = bool(self.config.get("random_destination", False))
         self._follow_speed_limits = bool(self.config.get("follow_speed_limits", False))
         self._ignore_traffic_lights = bool(self.config.get("ignore_traffic_lights", False))
@@ -252,12 +267,21 @@ class CarlaAgentAV:
         self._target_speed = self.config.get("target_speed", None)
         self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
 
-        self._yaw_sign = float(self.config.get("yaw_sign", -1.0))
+        legacy_yaw_sign = self._config_sign("yaw_sign", -1.0)
+        self._coordinate_y_sign = self._config_sign("coordinate_y_sign", legacy_yaw_sign)
+        self._yaw_sign = self._config_sign("yaw_sign", legacy_yaw_sign)
+        self._steer_sign = self._config_sign("steer_sign", legacy_yaw_sign)
         self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
         self._spawn_z_offset = float(self.config.get("spawn_z_offset", 3.0))
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
         self._reuse_generated_world = bool(self.config.get("reuse_generated_world", True))
         self._traffic_manager_port = int(os.environ.get("CARLA_TM_PORT", 8000))
+        self._object_identity_mode = str(self.config.get("object_identity_mode", "index")).lower()
+        if self._object_identity_mode not in OBJECT_IDENTITY_MODES:
+            raise ValueError(
+                f"Unsupported object_identity_mode: {self._object_identity_mode!r}. "
+                f"Expected one of: {', '.join(sorted(OBJECT_IDENTITY_MODES))}"
+            )
 
         if not self._ensure_connected():
             return InitResponse(success=False, msg="Failed to connect to CARLA within timeout")
@@ -360,8 +384,7 @@ class CarlaAgentAV:
         if hasattr(self._agent, "done") and self._agent.done():
             self._quit_flag = True
 
-        yaw_sign = self._yaw_sign if abs(self._yaw_sign) > 1e-6 else 1.0
-        steer_sv = float(control.steer) / yaw_sign
+        steer_sv = float(control.steer) / self._steer_sign
 
         return ControlCommand(
             mode=ControlMode.THROTTLE_STEER_BREAK,
@@ -420,13 +443,9 @@ class CarlaAgentAV:
             raise RuntimeError("CARLA world not available")
 
         bp_lib = self._world.get_blueprint_library()
-        try:
-            ego_bp = bp_lib.find(self._ego_bp_id)
-        except Exception as exc:
-            candidates = bp_lib.filter("vehicle.*")
-            if not candidates:
-                raise RuntimeError("No vehicle blueprints available in CARLA") from exc
-            ego_bp = candidates[0]
+        ego_bp = self._find_blueprint(bp_lib, (self._ego_bp_id, "vehicle.*"))
+        if ego_bp is None:
+            raise RuntimeError("No vehicle blueprints available in CARLA")
 
         if ego_bp.has_attribute("role_name"):
             ego_bp.set_attribute("role_name", self._ego_role_name)
@@ -613,36 +632,54 @@ class CarlaAgentAV:
             settings.fixed_delta_seconds = float(self._fixed_delta_seconds)
         self._world.apply_settings(settings)
 
+    def _find_blueprint(self, bp_lib, candidates: tuple[str, ...]):
+        for pattern in candidates:
+            try:
+                if "*" not in pattern:
+                    return bp_lib.find(pattern)
+                matches = bp_lib.filter(pattern)
+            except Exception:
+                logger.debug("CARLA blueprint lookup failed for pattern %s", pattern, exc_info=True)
+                continue
+            if matches:
+                return matches[0]
+        return None
+
+    def _pick_blueprint(self, obj_type: RoadObjectType):
+        if self._world is None:
+            return None
+        candidates = BLUEPRINT_CANDIDATES.get(obj_type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN])
+        return self._find_blueprint(self._world.get_blueprint_library(), candidates)
+
+    def _provided_object_identity(self, obj: ObjectStateData):
+        for attr in OBJECT_IDENTITY_ATTRS:
+            value = getattr(obj, attr, None)
+            if value not in (None, ""):
+                return attr, value
+        return None
+
+    def _object_identity(self, obj: ObjectStateData, index: int):
+        if self._object_identity_mode == "index":
+            return "index", index
+        if self._object_identity_mode == "stateless":
+            return "frame", index
+
+        identity = self._provided_object_identity(obj)
+        if identity is None:
+            raise RuntimeError(
+                "object_identity_mode='provided' requires each non-ego object to expose one of: "
+                f"{', '.join(OBJECT_IDENTITY_ATTRS)}"
+            )
+        return identity
+
+    def _role_name_for_object_key(self, key) -> str:
+        raw = "_".join(str(part) for part in key)
+        safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in raw)
+        return f"agent_{safe}"[:255]
+
     def _update_and_tick(self, obs: list[ObjectStateData]) -> None:
         if self._world is None:
             return
-
-        def pick_blueprint(obj_type: RoadObjectType):
-            if self._world is None:
-                return None
-            bp_lib = self._world.get_blueprint_library()
-            if obj_type == RoadObjectType.PEDESTRIAN:
-                return bp_lib.find("walker.pedestrian.0001")
-            elif obj_type == RoadObjectType.BUS:
-                return bp_lib.find("vehicle.mitsubishi.fusorosa")
-            elif obj_type == RoadObjectType.TRUCK:
-                return bp_lib.find("vehicle.carlamotors.carlacola")
-            elif obj_type == RoadObjectType.TRAILER:
-                return bp_lib.find("vehicle.carlamotors.firetruck")
-            elif obj_type == RoadObjectType.VAN:
-                return bp_lib.find("vehicle.mercedes.sprinter")
-            elif obj_type == RoadObjectType.MOTORCYCLE:
-                return bp_lib.find("vehicle.vespa.zx125")
-            elif obj_type == RoadObjectType.BICYCLE:
-                return bp_lib.find("vehicle.bh.crossbike")
-            else:
-                candidates = bp_lib.filter("vehicle.*")
-
-            if not candidates and obj_type != RoadObjectType.PEDESTRIAN:
-                candidates = bp_lib.filter("vehicle.*")
-            if not candidates:
-                return None
-            return candidates[0]
 
         def make_transform(kin, z_offset: float = 0.0):
             loc = self._to_carla_location(kin)
@@ -704,62 +741,77 @@ class CarlaAgentAV:
         ego_state = obs[0].kinematic
         apply_kinematic(self._vehicle, ego_state)
 
-        desired_count = max(len(obs) - 1, 0)
-        while len(self._other_actors) < desired_count:
-            self._other_actors.append(None)
-            self._other_actor_types.append(RoadObjectType.UNKNOWN)
-        while len(self._other_actors) > desired_count:
-            actor = self._other_actors.pop()
-            self._other_actor_types.pop()
-            if actor is not None:
-                try:
-                    actor.destroy()
-                    self._spawned_actor_ids.discard(actor.id)
-                except Exception:
-                    logger.exception("Failed to destroy extra actor")
+        if self._object_identity_mode == "stateless":
+            self._destroy_other_actors()
 
+        observed_keys = set()
         for idx, obj in enumerate(obs[1:]):
-            actor = self._other_actors[idx]
+            key = self._object_identity(obj, idx)
+            observed_keys.add(key)
+            actor = self._other_actors_by_key.get(key)
             obj_type = obj.type
             if (
                 actor is None
                 or (hasattr(actor, "is_alive") and not actor.is_alive)
-                or self._other_actor_types[idx] != obj_type
+                or self._other_actor_types_by_key.get(key) != obj_type
             ):
                 if actor is not None:
-                    try:
-                        actor.destroy()
-                        self._spawned_actor_ids.discard(actor.id)
-                    except Exception:
-                        logger.exception("Failed to destroy actor %s", idx)
-                bp = pick_blueprint(obj_type)
+                    actor_id = getattr(actor, "id", None)
+                    if destroy_actor(actor, log=logger, label="actor"):
+                        self._spawned_actor_ids.discard(actor_id)
+                bp = self._pick_blueprint(obj_type)
                 if bp is None:
                     logger.warning("No blueprint for object type %s", obj_type)
-                    self._other_actors[idx] = None
-                    self._other_actor_types[idx] = obj_type
+                    self._other_actors_by_key[key] = None
+                    self._other_actor_types_by_key[key] = obj_type
                     continue
                 if bp.has_attribute("role_name"):
-                    bp.set_attribute("role_name", f"agent_{idx}")
+                    bp.set_attribute("role_name", self._role_name_for_object_key(key))
                 transform = make_transform(obj.kinematic, z_offset=self._spawn_z_offset)
                 actor = self._world.try_spawn_actor(bp, transform)
                 if actor is None:
-                    logger.warning("Failed to spawn actor for index %s", idx)
+                    logger.warning("Failed to spawn actor for object %s", key)
                 else:
                     self._spawned_actor_ids.add(actor.id)
-                self._other_actors[idx] = actor
-                self._other_actor_types[idx] = obj_type
+                self._other_actors_by_key[key] = actor
+                self._other_actor_types_by_key[key] = obj_type
 
-            apply_kinematic(self._other_actors[idx], obj.kinematic)
+            apply_kinematic(self._other_actors_by_key.get(key), obj.kinematic)
+
+        for key in set(self._other_actors_by_key) - observed_keys:
+            actor = self._other_actors_by_key.pop(key)
+            self._other_actor_types_by_key.pop(key, None)
+            actor_id = getattr(actor, "id", None)
+            if destroy_actor(actor, log=logger, label="stale actor"):
+                self._spawned_actor_ids.discard(actor_id)
+
+        self._other_actors = list(self._other_actors_by_key.values())
+        self._other_actor_types = list(self._other_actor_types_by_key.values())
 
         if self._sync:
             self._world.tick()
         else:
             self._world.wait_for_tick()
 
+    def _destroy_other_actors(self) -> None:
+        other_actors_by_key = getattr(self, "_other_actors_by_key", {})
+        other_actor_types_by_key = getattr(self, "_other_actor_types_by_key", {})
+        actors = list(other_actors_by_key.values()) or list(self._other_actors)
+        for actor in actors:
+            actor_id = getattr(actor, "id", None)
+            if destroy_actor(actor, log=logger, label="actor"):
+                self._spawned_actor_ids.discard(actor_id)
+        self._other_actors.clear()
+        self._other_actor_types.clear()
+        other_actors_by_key.clear()
+        other_actor_types_by_key.clear()
+
     def _destroy_spawned_actors(self) -> None:
         if self._world is None:
             self._other_actors.clear()
             self._other_actor_types.clear()
+            self._other_actors_by_key.clear()
+            self._other_actor_types_by_key.clear()
             self._spawned_actor_ids.clear()
             return
 
@@ -781,17 +833,22 @@ class CarlaAgentAV:
             if destroy_actor(actor, log=logger, label="spawned actor"):
                 destroyed_actor_ids.add(actor_id)
 
-        for actor in [self._vehicle, *list(self._other_actors)]:
+        other_actors_by_key = getattr(self, "_other_actors_by_key", {})
+        other_actor_types_by_key = getattr(self, "_other_actor_types_by_key", {})
+        other_actors = list(other_actors_by_key.values()) or list(self._other_actors)
+        for actor in [self._vehicle, *other_actors]:
             actor_id = getattr(actor, "id", None)
             if actor_id is not None and actor_id in destroyed_actor_ids:
                 continue
             destroy_actor(actor, log=logger, label="actor")
 
         self._vehicle = None
-        for actor in list(self._other_actors):
+        for actor in other_actors:
             actor_id = getattr(actor, "id", None)
             if actor_id is not None:
                 self._spawned_actor_ids.discard(actor_id)
         self._other_actors.clear()
         self._other_actor_types.clear()
+        other_actors_by_key.clear()
+        other_actor_types_by_key.clear()
         self._spawned_actor_ids.clear()

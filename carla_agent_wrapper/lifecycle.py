@@ -77,12 +77,8 @@ def clear_dynamic_actors(
     for actor in actors:
         if not is_dynamic_actor(actor):
             continue
-        actor_id = getattr(actor, "id", "<unknown>")
-        try:
-            actor.destroy()
+        if destroy_actor(actor, log=log, label="dynamic actor"):
             destroyed_count += 1
-        except Exception:
-            log.exception("Failed to destroy dynamic actor %s", actor_id)
 
     if destroyed_count:
         log.info("Destroyed %s dynamic CARLA actors before reset", destroyed_count)
@@ -95,7 +91,10 @@ def destroy_actor(actor: Any, *, log: logging.Logger = logger, label: str = "act
 
     actor_id = getattr(actor, "id", "<unknown>")
     try:
-        actor.destroy()
+        result = actor.destroy()
+        if result is False:
+            log.warning("CARLA reported failure while destroying %s %s", label, actor_id)
+            return False
         return True
     except Exception:
         log.exception("Failed to destroy %s %s", label, actor_id)
