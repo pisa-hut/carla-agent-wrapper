@@ -126,7 +126,9 @@ class CarlaAgentAV:
     def _ensure_connected(self) -> bool:
         config = getattr(self, "config", {}) or {}
         timeout = float(
-            config.get("carla_connect_timeout_seconds", float(config.get("max_retry_times", 15)) * 2)
+            config.get(
+                "carla_connect_timeout_seconds", float(config.get("max_retry_times", 15)) * 2
+            )
         )
         retry_interval = float(config.get("retry_interval_seconds", 2.0))
         end_time = time.time() + timeout
@@ -276,7 +278,9 @@ class CarlaAgentAV:
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
         self._reuse_generated_world = bool(self.config.get("reuse_generated_world", True))
         self._traffic_manager_port = int(os.environ.get("CARLA_TM_PORT", 8000))
-        self._object_identity_mode = str(self.config.get("object_identity_mode", "index")).lower()
+        self._object_identity_mode = str(
+            self.config.get("object_identity_mode", "stateless")
+        ).lower()
         if self._object_identity_mode not in OBJECT_IDENTITY_MODES:
             raise ValueError(
                 f"Unsupported object_identity_mode: {self._object_identity_mode!r}. "
@@ -648,7 +652,9 @@ class CarlaAgentAV:
     def _pick_blueprint(self, obj_type: RoadObjectType):
         if self._world is None:
             return None
-        candidates = BLUEPRINT_CANDIDATES.get(obj_type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN])
+        candidates = BLUEPRINT_CANDIDATES.get(
+            obj_type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN]
+        )
         return self._find_blueprint(self._world.get_blueprint_library(), candidates)
 
     def _provided_object_identity(self, obj: ObjectStateData):

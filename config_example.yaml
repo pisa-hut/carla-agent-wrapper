@@ -16,7 +16,6 @@ retry_interval_seconds: 2.0
 # carla_connect_timeout_seconds is not set.
 max_retry_times: 15
 
-
 # ---------------------------------------------------------------------------
 # CARLA world / simulation settings
 # ---------------------------------------------------------------------------
@@ -36,7 +35,6 @@ xodr_root: /mnt/map/xodr
 # overwritten between tests.
 reuse_generated_world: true
 
-
 # ---------------------------------------------------------------------------
 # Ego vehicle
 # ---------------------------------------------------------------------------
@@ -51,7 +49,6 @@ ego_bp_id: vehicle.tesla.model3
 # Added to spawn and destination z coordinates to avoid underground spawn
 # issues on generated OpenDRIVE maps.
 spawn_z_offset: 3.0
-
 
 # ---------------------------------------------------------------------------
 # CARLA navigation agent
@@ -92,7 +89,6 @@ target_speed: null
 # km/h for CARLA agents. Leave false when target_speed is already km/h.
 target_speed_is_mps: false
 
-
 # ---------------------------------------------------------------------------
 # Coordinate / control conversion
 # ---------------------------------------------------------------------------
@@ -113,7 +109,6 @@ steer_sign: -1.0
 # Constant yaw offset, in degrees, added after applying yaw_sign.
 yaw_offset_deg: 0.0
 
-
 # ---------------------------------------------------------------------------
 # Non-ego object lifecycle
 # ---------------------------------------------------------------------------
@@ -126,8 +121,7 @@ yaw_offset_deg: 0.0
 #             Raises an error if an object lacks a provided identity.
 # - stateless: Destroy and recreate non-ego actors every step. Most conservative
 #              but least efficient.
-object_identity_mode: index
-
+object_identity_mode: stateless
 
 # ---------------------------------------------------------------------------
 # Environment variables used outside request.config
