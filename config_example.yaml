@@ -1,0 +1,134 @@
+# CARLA Agent Wrapper configuration.
+# This file is intentionally flat because the wrapper reads request.config by key.
+
+# ---------------------------------------------------------------------------
+# CARLA connection / retry
+# ---------------------------------------------------------------------------
+
+# Total time, in seconds, to wait for the CARLA server to become reachable
+# during Init. If omitted, the wrapper falls back to max_retry_times * 2.
+carla_connect_timeout_seconds: 30.0
+
+# Delay, in seconds, between CARLA connection attempts.
+retry_interval_seconds: 2.0
+
+# Legacy retry count used only to derive carla_connect_timeout_seconds when
+# carla_connect_timeout_seconds is not set.
+max_retry_times: 15
+
+# ---------------------------------------------------------------------------
+# CARLA world / simulation settings
+# ---------------------------------------------------------------------------
+
+# Run CARLA in synchronous mode. Recommended for deterministic test cycles.
+sync: true
+
+# Disable rendering in CARLA for performance. This does not prevent physics
+# and agent logic from running.
+no_rendering: true
+
+# Directory containing OpenDRIVE maps. reset() loads {xodr_root}/{map_name}.xodr.
+xodr_root: /mnt/map/xodr
+
+# Reuse the generated CARLA OpenDRIVE world when consecutive resets use the
+# same map_name and xodr_root path. Set false if the same .xodr path may be
+# overwritten between tests.
+reuse_generated_world: true
+
+# ---------------------------------------------------------------------------
+# Ego vehicle
+# ---------------------------------------------------------------------------
+
+# CARLA role_name assigned to the ego actor when spawned.
+ego_role_name: hero
+
+# Preferred CARLA blueprint id for the ego vehicle. Falls back to vehicle.*
+# if the exact blueprint is unavailable.
+ego_bp_id: vehicle.tesla.model3
+
+# Added to spawn and destination z coordinates to avoid underground spawn
+# issues on generated OpenDRIVE maps.
+spawn_z_offset: 3.0
+
+# ---------------------------------------------------------------------------
+# CARLA navigation agent
+# ---------------------------------------------------------------------------
+
+# Agent implementation. Supported values:
+# - behavior
+# - basic
+# - constant_velocity
+# - constant-velocity
+agent_type: behavior
+
+# BehaviorAgent profile. Used only when agent_type is behavior.
+# Supported values: cautious, normal, aggressive.
+behavior: normal
+
+# Pick a random destination from CARLA map spawn points instead of using the
+# scenario pack ego goal position.
+random_destination: false
+
+# Let the CARLA agent follow map speed limits when supported by the agent.
+follow_speed_limits: false
+
+# Tell the CARLA agent to ignore traffic lights when supported by the agent.
+ignore_traffic_lights: false
+
+# Tell the CARLA agent to ignore stop signs when supported by the agent.
+ignore_stop_signs: false
+
+# Tell the CARLA agent to ignore other vehicles when supported by the agent.
+ignore_vehicles: false
+
+# Optional target speed for the CARLA agent. Use null to read
+# scenario_pack.ego.target_speed, falling back to 0.0 if absent.
+target_speed: null
+
+# Set true when target_speed is provided in m/s. The wrapper converts it to
+# km/h for CARLA agents. Leave false when target_speed is already km/h.
+target_speed_is_mps: false
+
+# ---------------------------------------------------------------------------
+# Coordinate / control conversion
+# ---------------------------------------------------------------------------
+
+# Sign used when converting scenario yaw radians to CARLA yaw degrees.
+# Must be non-zero; positive values are normalized to 1, negative to -1.
+yaw_sign: -1.0
+
+# Sign used when converting scenario y coordinates to CARLA y coordinates.
+# Defaults to yaw_sign if omitted. Keep separate when coordinate handedness
+# and yaw handedness differ.
+coordinate_y_sign: -1.0
+
+# Sign used when converting CARLA steer output back to the simulator steer
+# convention. Defaults to yaw_sign if omitted.
+steer_sign: -1.0
+
+# Constant yaw offset, in degrees, added after applying yaw_sign.
+yaw_offset_deg: 0.0
+
+# ---------------------------------------------------------------------------
+# Non-ego object lifecycle
+# ---------------------------------------------------------------------------
+
+# How the wrapper associates incoming non-ego observations with CARLA actors.
+# Supported values:
+# - index: Use object list order as identity. Fastest; requires the simulator
+#          to keep non-ego object ordering stable across steps.
+# - provided: Use id/object_id/track_id/external_id/name attributes if present.
+#             Raises an error if an object lacks a provided identity.
+# - stateless: Destroy and recreate non-ego actors every step. Most conservative
+#              but least efficient.
+object_identity_mode: stateless
+
+# ---------------------------------------------------------------------------
+# Environment variables used outside request.config
+# ---------------------------------------------------------------------------
+# These are not read from request.config; set them in the container/runtime env.
+#
+# CARLA_HOST: CARLA RPC host. Default: localhost
+# CARLA_PORT: CARLA RPC port and launched server port. Default: 2000
+# CARLA_TIMEOUT: CARLA client timeout after connection. Default: 10.0
+# CARLA_TM_PORT: TrafficManager port used during cleanup. Default: 8000
