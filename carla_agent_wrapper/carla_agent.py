@@ -292,7 +292,7 @@ class CarlaAgentAV:
 
         self._prepare_reused_server_state()
         self._quit_flag = False
-        return InitResponse(success=True)
+        return InitResponse(success=True, msg="CARLA agent initialized successfully")
 
     def reset(
         self,

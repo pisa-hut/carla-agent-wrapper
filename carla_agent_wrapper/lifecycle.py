@@ -44,10 +44,10 @@ def force_async_world_for_cleanup(
     if client is None:
         return
 
-    try:
-        client.get_trafficmanager(traffic_manager_port).set_synchronous_mode(False)
-    except Exception:
-        log.exception("Failed to force TrafficManager to async mode for cleanup")
+    # try:
+    #     client.get_trafficmanager(traffic_manager_port).set_synchronous_mode(False)
+    # except Exception:
+    #     log.exception("Failed to force TrafficManager to async mode for cleanup")
 
 
 def clear_dynamic_actors(
