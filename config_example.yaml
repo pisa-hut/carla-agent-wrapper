@@ -89,6 +89,18 @@ target_speed: null
 # km/h for CARLA agents. Leave false when target_speed is already km/h.
 target_speed_is_mps: false
 
+# CARLA GlobalRoutePlanner samples the route at this interval. Smaller values
+# make the final route waypoint closer to the requested destination, reducing
+# early agent.done() near the goal.
+route_sampling_resolution: 0.5
+
+# CARLA LocalPlanner removes passed waypoints when the ego is within:
+# base_min_distance + distance_ratio * speed_mps. Keep this high enough for
+# stable waypoint tracking; use route_sampling_resolution to make the route
+# endpoint itself closer to the requested goal.
+local_planner_base_min_distance: 1.0
+local_planner_distance_ratio: 0.0
+
 # ---------------------------------------------------------------------------
 # Coordinate / control conversion
 # ---------------------------------------------------------------------------

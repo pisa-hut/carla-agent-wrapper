@@ -222,13 +222,38 @@ class CarlaAgentAV:
         if self._vehicle is None:
             return None
 
+        agent_opt_dict = {
+            "sampling_resolution": self._route_sampling_resolution,
+            "base_min_distance": self._local_planner_base_min_distance,
+            "distance_ratio": self._local_planner_distance_ratio,
+        }
         if self._agent_type == "behavior":
-            agent = self._BehaviorAgent(self._vehicle, behavior=self._behavior, map_inst=self._map)
+            agent = self._BehaviorAgent(
+                self._vehicle,
+                behavior=self._behavior,
+                opt_dict=agent_opt_dict,
+                map_inst=self._map,
+            )
+            self._configure_local_planner(agent)
+            print(
+                f"Initialized CARLA BehaviorAgent with behavior={self._behavior}, target_speed_kmh={target_speed_kmh}"
+            )
+
         elif self._agent_type == "basic":
-            agent = self._BasicAgent(self._vehicle, map_inst=self._map)
+            agent = self._BasicAgent(
+                self._vehicle,
+                target_speed=target_speed_kmh,
+                opt_dict=agent_opt_dict,
+                map_inst=self._map,
+            )
+            self._configure_local_planner(agent)
+            print(f"Initialized CARLA BasicAgent with target_speed_kmh={target_speed_kmh}")
         elif self._agent_type in ("constant_velocity", "constant-velocity"):
             agent = self._ConstantVelocityAgent(
-                self._vehicle, target_speed=target_speed_kmh, map_inst=self._map
+                self._vehicle,
+                target_speed=target_speed_kmh,
+                opt_dict=agent_opt_dict,
+                map_inst=self._map,
             )
         else:
             raise ValueError(f"Unsupported CARLA agent_type: {self._agent_type!r}")
@@ -243,6 +268,15 @@ class CarlaAgentAV:
         if hasattr(agent, "ignore_vehicles"):
             agent.ignore_vehicles(self._ignore_vehicles)
         return agent
+
+    def _configure_local_planner(self, agent) -> None:
+        local_planner = getattr(agent, "_local_planner", None)
+        if local_planner is None:
+            return
+
+        local_planner._base_min_distance = self._local_planner_base_min_distance
+        local_planner._distance_ratio = self._local_planner_distance_ratio
+        local_planner._min_distance = self._local_planner_base_min_distance
 
     def init(self, request: InitRequest) -> InitResponse | None:
         self._output_dir = request.output_dir
@@ -268,6 +302,13 @@ class CarlaAgentAV:
 
         self._target_speed = self.config.get("target_speed", None)
         self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
+        self._local_planner_base_min_distance = float(
+            self.config.get("local_planner_base_min_distance", 1.0)
+        )
+        self._local_planner_distance_ratio = float(
+            self.config.get("local_planner_distance_ratio", 0.0)
+        )
+        self._route_sampling_resolution = float(self.config.get("route_sampling_resolution", 0.5))
 
         legacy_yaw_sign = self._config_sign("yaw_sign", -1.0)
         self._coordinate_y_sign = self._config_sign("coordinate_y_sign", legacy_yaw_sign)

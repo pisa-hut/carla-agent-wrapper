@@ -142,6 +142,22 @@ class _FakeMovingActor(_FakeActor):
 
 class _FakeAgent:
     def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self._local_planner = SimpleNamespace()
+
+    def set_target_speed(self, speed):
+        self.target_speed = speed
+
+    def set_destination(self, *args, **kwargs):
+        pass
+
+    def run_step(self):
+        return SimpleNamespace(throttle=0.0, brake=0.0, steer=0.0)
+
+
+class _FakeAgentWithoutLocalPlanner:
+    def __init__(self, *args, **kwargs):
         pass
 
     def set_target_speed(self, speed):
@@ -250,6 +266,33 @@ def test_init_rejects_invalid_behavior(carla_agent_module) -> None:
 
     with pytest.raises(ValueError, match="Unsupported CARLA behavior"):
         adapter.init(request)
+
+
+def test_build_agent_configures_local_planner_completion_distance(carla_agent_module) -> None:
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    adapter._vehicle = object()
+    adapter._map = object()
+    adapter._agent_type = "behavior"
+    adapter._behavior = "aggressive"
+    adapter._BehaviorAgent = _FakeAgent
+    adapter._local_planner_base_min_distance = 0.25
+    adapter._local_planner_distance_ratio = 0.0
+    adapter._route_sampling_resolution = 0.5
+    adapter._follow_speed_limits = False
+    adapter._ignore_traffic_lights = False
+    adapter._ignore_stop_signs = False
+    adapter._ignore_vehicles = False
+
+    agent = adapter._build_agent(target_speed_kmh=50.0)
+
+    assert agent._local_planner._base_min_distance == 0.25
+    assert agent._local_planner._distance_ratio == 0.0
+    assert agent._local_planner._min_distance == 0.25
+    assert agent.kwargs["opt_dict"] == {
+        "sampling_resolution": 0.5,
+        "base_min_distance": 0.25,
+        "distance_ratio": 0.0,
+    }
 
 
 def test_ensure_world_reuses_cached_opendrive_world(carla_agent_module, tmp_path) -> None:
