@@ -175,6 +175,11 @@ class _RouteFailingAgent(_FakeAgent):
         raise RuntimeError("route impossible")
 
 
+class _DoneAgent(_FakeAgent):
+    def done(self):
+        return True
+
+
 @pytest.fixture
 def carla_agent_module(monkeypatch):
     fake_carla = ModuleType("carla")
@@ -366,11 +371,26 @@ def test_step_rejects_missing_ego_state(carla_agent_module) -> None:
 def test_should_quit_returns_response(carla_agent_module) -> None:
     adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
     adapter._quit_flag = True
+    adapter._quit_msg = "CARLA agent reached the destination."
 
     response = adapter.should_quit()
 
     assert isinstance(response, carla_agent_module.ShouldQuitResponse)
     assert response.should_quit is True
+    assert response.msg == "CARLA agent reached the destination."
+
+
+def test_step_sets_destination_reached_quit_message(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "stateless"
+    adapter._agent = _DoneAgent()
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+
+    adapter.step(SimpleNamespace(observation=[ego]))
+    response = adapter.should_quit()
+
+    assert response.should_quit is True
+    assert response.msg == "CARLA agent reached the destination."
 
 
 def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:

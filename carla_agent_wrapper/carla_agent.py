@@ -86,6 +86,7 @@ class CarlaAgentAV:
         self._finalized = True
 
         self._quit_flag = False
+        self._quit_msg = ""
 
         self._server_log_path = "/mnt/output/carla_server"
         os.makedirs(self._server_log_path, exist_ok=True)
@@ -360,6 +361,7 @@ class CarlaAgentAV:
 
         self._prepare_reused_server_state()
         self._quit_flag = False
+        self._quit_msg = ""
         return None
 
     def reset(
@@ -376,6 +378,7 @@ class CarlaAgentAV:
         init_obs = request.initial_observation
         self._sps = sps
         self._quit_flag = False
+        self._quit_msg = ""
 
         try:
             if sps is None:
@@ -465,6 +468,7 @@ class CarlaAgentAV:
         control = self._agent.run_step()
         if hasattr(self._agent, "done") and self._agent.done():
             self._quit_flag = True
+            self._quit_msg = "CARLA agent reached the destination."
 
         steer_sv = float(control.steer) / getattr(self, "_steer_sign", 1.0)
         return StepResponse(
@@ -480,6 +484,7 @@ class CarlaAgentAV:
 
     def stop(self) -> None:
         self._finalize()
+        self._quit_msg = "CARLA service stopped."
         self._terminate_server_process()
         self._client = None
         self._server_version = None
@@ -497,6 +502,7 @@ class CarlaAgentAV:
         self._agent = None
         self._vehicle = None
         self._quit_flag = True
+        self._quit_msg = "CARLA agent finalized."
         self._finalized = True
 
     def _terminate_server_process(self) -> None:
@@ -519,7 +525,10 @@ class CarlaAgentAV:
             self._server_process = None
 
     def should_quit(self) -> ShouldQuitResponse:
-        return ShouldQuitResponse(should_quit=self._quit_flag)
+        return ShouldQuitResponse(
+            should_quit=self._quit_flag,
+            msg=getattr(self, "_quit_msg", ""),
+        )
 
     def _ensure_route_ends_at_waypoint(self, end_wp) -> None:
         local_planner = getattr(self._agent, "_local_planner", None)
