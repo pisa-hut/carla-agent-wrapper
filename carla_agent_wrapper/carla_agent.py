@@ -332,10 +332,10 @@ class CarlaAgentAV:
         self._target_speed = self.config.get("target_speed", None)
         self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
         self._local_planner_base_min_distance = self._config_float(
-            "local_planner_base_min_distance", 1.0
+            "local_planner_base_min_distance", 3.0
         )
-        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.0)
-        self._route_sampling_resolution = self._config_float("route_sampling_resolution", 0.2)
+        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.5)
+        self._route_sampling_resolution = self._config_float("route_sampling_resolution", 3.0)
 
         legacy_yaw_sign = self._config_sign("yaw_sign", -1.0)
         self._coordinate_y_sign = self._config_sign("coordinate_y_sign", legacy_yaw_sign)
@@ -436,6 +436,7 @@ class CarlaAgentAV:
             )
             try:
                 self._agent.set_destination(end_wp.transform.location, start_wp.transform.location)
+                self._ensure_route_ends_at_waypoint(end_wp)
             except Exception as exc:
                 raise AvPreconditionFailed(
                     f"CARLA agent_type={self._agent_type!r} failed to plan a route. "
@@ -519,6 +520,33 @@ class CarlaAgentAV:
 
     def should_quit(self) -> ShouldQuitResponse:
         return ShouldQuitResponse(should_quit=self._quit_flag)
+
+    def _ensure_route_ends_at_waypoint(self, end_wp) -> None:
+        local_planner = getattr(self._agent, "_local_planner", None)
+        route_queue = getattr(local_planner, "_waypoints_queue", None)
+        if route_queue is None:
+            return
+
+        end_loc = end_wp.transform.location
+        road_option = None
+        if route_queue:
+            last_wp, road_option = route_queue[-1]
+            if self._location_distance(last_wp.transform.location, end_loc) < 1e-3:
+                return
+        else:
+            road_option = getattr(local_planner, "target_road_option", None)
+
+        route_queue.append((end_wp, road_option))
+
+    @staticmethod
+    def _location_distance(a, b) -> float:
+        if hasattr(a, "distance"):
+            return float(a.distance(b))
+        return math.sqrt(
+            (float(a.x) - float(b.x)) ** 2
+            + (float(a.y) - float(b.y)) ** 2
+            + (float(a.z) - float(b.z)) ** 2
+        )
 
     def _spawn_ego(self, init_obs: list[ObjectStateData] | None, sps: ScenarioPackData):
         if self._world is None:

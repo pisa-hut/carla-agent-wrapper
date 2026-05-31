@@ -321,6 +321,27 @@ def test_build_agent_configures_local_planner_completion_distance(carla_agent_mo
     }
 
 
+def test_route_is_forced_to_end_at_destination_waypoint(carla_agent_module) -> None:
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+
+    def waypoint(x):
+        return SimpleNamespace(
+            transform=SimpleNamespace(location=SimpleNamespace(x=x, y=0.0, z=0.0))
+        )
+
+    route_queue = [(waypoint(196.0), "LANEFOLLOW")]
+    adapter._agent = SimpleNamespace(_local_planner=SimpleNamespace(_waypoints_queue=route_queue))
+    end_wp = waypoint(200.0)
+
+    adapter._ensure_route_ends_at_waypoint(end_wp)
+    adapter._ensure_route_ends_at_waypoint(end_wp)
+
+    assert route_queue == [
+        (route_queue[0][0], "LANEFOLLOW"),
+        (end_wp, "LANEFOLLOW"),
+    ]
+
+
 def test_step_returns_step_response(carla_agent_module) -> None:
     adapter, world = _make_tracking_adapter(carla_agent_module)
     adapter._object_identity_mode = "stateless"
