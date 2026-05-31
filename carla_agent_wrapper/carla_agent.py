@@ -26,6 +26,7 @@ from pisa_api.av import (
     ResetResponse,
     RoadObjectType,
     ScenarioPackData,
+    ShouldQuitResponse,
     StepRequest,
     StepResponse,
 )
@@ -334,7 +335,7 @@ class CarlaAgentAV:
             "local_planner_base_min_distance", 1.0
         )
         self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.0)
-        self._route_sampling_resolution = self._config_float("route_sampling_resolution", 0.5)
+        self._route_sampling_resolution = self._config_float("route_sampling_resolution", 0.2)
 
         legacy_yaw_sign = self._config_sign("yaw_sign", -1.0)
         self._coordinate_y_sign = self._config_sign("coordinate_y_sign", legacy_yaw_sign)
@@ -516,8 +517,8 @@ class CarlaAgentAV:
         finally:
             self._server_process = None
 
-    def should_quit(self) -> bool:
-        return self._quit_flag
+    def should_quit(self) -> ShouldQuitResponse:
+        return ShouldQuitResponse(should_quit=self._quit_flag)
 
     def _spawn_ego(self, init_obs: list[ObjectStateData] | None, sps: ScenarioPackData):
         if self._world is None:

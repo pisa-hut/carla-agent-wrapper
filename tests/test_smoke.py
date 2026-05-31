@@ -342,6 +342,16 @@ def test_step_rejects_missing_ego_state(carla_agent_module) -> None:
         adapter.step(SimpleNamespace(observation=[]))
 
 
+def test_should_quit_returns_response(carla_agent_module) -> None:
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    adapter._quit_flag = True
+
+    response = adapter.should_quit()
+
+    assert isinstance(response, carla_agent_module.ShouldQuitResponse)
+    assert response.should_quit is True
+
+
 def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:
     adapter, _world = _make_tracking_adapter(carla_agent_module)
     adapter._vehicle = None
