@@ -170,6 +170,11 @@ class _FakeAgentWithoutLocalPlanner:
         return SimpleNamespace(throttle=0.0, brake=0.0, steer=0.0)
 
 
+class _RouteFailingAgent(_FakeAgent):
+    def set_destination(self, *args, **kwargs):
+        raise RuntimeError("route impossible")
+
+
 @pytest.fixture
 def carla_agent_module(monkeypatch):
     fake_carla = ModuleType("carla")
@@ -239,7 +244,7 @@ def test_destroy_actor_treats_false_return_as_failure() -> None:
     assert actor.destroy_calls == 1
 
 
-def test_reset_finalizes_previous_run_and_partial_state_on_failure(carla_agent_module) -> None:
+def test_reset_does_not_wrap_unclassified_runtime_error(carla_agent_module) -> None:
     adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
     calls = []
     adapter._finalized = False
@@ -255,6 +260,27 @@ def test_reset_finalizes_previous_run_and_partial_state_on_failure(carla_agent_m
     with pytest.raises(RuntimeError, match="world failed"):
         adapter.reset(request)
 
+    assert calls == ["finalize"]
+
+
+def test_reset_finalizes_partial_state_for_classified_av_error(carla_agent_module) -> None:
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    calls = []
+    adapter._finalized = False
+    adapter._finalize = lambda: calls.append("finalize")
+    adapter._ensure_world = lambda map_name: (_ for _ in ()).throw(
+        carla_agent_module.InvalidAvRequest("bad scenario")
+    )
+
+    request = SimpleNamespace(
+        output_dir="run",
+        scenario_pack=SimpleNamespace(map_name="Town01"),
+        initial_observation=[],
+    )
+
+    with pytest.raises(carla_agent_module.InvalidAvRequest, match="bad scenario"):
+        adapter.reset(request)
+
     assert calls == ["finalize", "finalize"]
 
 
@@ -264,7 +290,7 @@ def test_init_rejects_invalid_behavior(carla_agent_module) -> None:
 
     request = SimpleNamespace(output_dir="out", config={"behavior": "fast"}, dt=0.05)
 
-    with pytest.raises(ValueError, match="Unsupported CARLA behavior"):
+    with pytest.raises(carla_agent_module.InvalidAvRequest, match="Unsupported CARLA behavior"):
         adapter.init(request)
 
 
@@ -293,6 +319,87 @@ def test_build_agent_configures_local_planner_completion_distance(carla_agent_mo
         "base_min_distance": 0.25,
         "distance_ratio": 0.0,
     }
+
+
+def test_step_returns_step_response(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "stateless"
+    adapter._agent = _FakeAgent()
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+
+    response = adapter.step(SimpleNamespace(observation=[ego]))
+
+    assert isinstance(response, carla_agent_module.StepResponse)
+    assert response.ctrl_cmd.payload["throttle"] == pytest.approx(0.0)
+    assert world.tick_calls == 1
+
+
+def test_step_rejects_missing_ego_state(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._agent = _FakeAgent()
+
+    with pytest.raises(carla_agent_module.InvalidAvRequest, match="ego state"):
+        adapter.step(SimpleNamespace(observation=[]))
+
+
+def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._vehicle = None
+    adapter._agent = _FakeAgent()
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+
+    with pytest.raises(RuntimeError, match="Ego vehicle not found"):
+        adapter.step(SimpleNamespace(observation=[ego]))
+
+
+def test_route_failure_is_concrete_precondition_failure(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._finalized = True
+    adapter._ensure_world = lambda map_name: None
+    adapter._clear_dynamic_actors = lambda: None
+    adapter._apply_world_settings = lambda: None
+    vehicle = adapter._vehicle
+    adapter._spawn_ego = lambda init_obs, sps: vehicle
+    vehicle.get_transform = lambda: SimpleNamespace(
+        location=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+        rotation=SimpleNamespace(yaw=0.0),
+    )
+    adapter._map = SimpleNamespace(
+        get_waypoint=lambda location, project_to_road: SimpleNamespace(
+            transform=SimpleNamespace(location=location),
+            road_id=1,
+            section_id=1,
+            lane_id=1,
+            s=0.0,
+        )
+    )
+    adapter._agent_type = "behavior"
+    adapter._BehaviorAgent = _RouteFailingAgent
+    adapter._behavior = "normal"
+    adapter._route_sampling_resolution = 0.5
+    adapter._local_planner_base_min_distance = 1.0
+    adapter._local_planner_distance_ratio = 0.0
+    adapter._follow_speed_limits = False
+    adapter._ignore_traffic_lights = False
+    adapter._ignore_stop_signs = False
+    adapter._ignore_vehicles = False
+    adapter._random_destination = False
+    adapter._target_speed = 0.0
+    adapter._target_speed_is_mps = False
+    adapter._spawn_z_offset = 0.0
+    adapter._steer_sign = 1.0
+
+    pos = SimpleNamespace(x=1.0, y=0.0, z=0.0)
+    sps = SimpleNamespace(
+        map_name="Town01",
+        ego=SimpleNamespace(goal_config=SimpleNamespace(position=pos), target_speed=0.0),
+    )
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+
+    with pytest.raises(carla_agent_module.AvPreconditionFailed, match="failed to plan"):
+        adapter.reset(
+            SimpleNamespace(output_dir="run", scenario_pack=sps, initial_observation=[ego])
+        )
 
 
 def test_ensure_world_reuses_cached_opendrive_world(carla_agent_module, tmp_path) -> None:
@@ -409,7 +516,9 @@ def test_provided_identity_mode_requires_object_id(carla_agent_module) -> None:
     ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
     obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
 
-    with pytest.raises(RuntimeError, match="object_identity_mode='provided'"):
+    with pytest.raises(
+        carla_agent_module.InvalidAvRequest, match="object_identity_mode='provided'"
+    ):
         adapter._update_and_tick([ego, obj])
 
 

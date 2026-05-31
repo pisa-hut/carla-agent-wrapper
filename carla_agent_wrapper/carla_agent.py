@@ -13,10 +13,14 @@ from agents.navigation.basic_agent import BasicAgent
 from agents.navigation.behavior_agent import BehaviorAgent
 from agents.navigation.constant_velocity_agent import ConstantVelocityAgent
 from pisa_api.av import (
+    AvError,
+    AvPreconditionFailed,
+    AvTimeout,
+    AvUnavailable,
     ControlCommand,
     ControlMode,
     InitRequest,
-    InitResponse,
+    InvalidAvRequest,
     ObjectStateData,
     ResetRequest,
     ResetResponse,
@@ -125,12 +129,15 @@ class CarlaAgentAV:
 
     def _ensure_connected(self) -> bool:
         config = getattr(self, "config", {}) or {}
-        timeout = float(
-            config.get(
-                "carla_connect_timeout_seconds", float(config.get("max_retry_times", 15)) * 2
-            )
-        )
-        retry_interval = float(config.get("retry_interval_seconds", 2.0))
+        if "carla_connect_timeout_seconds" in config:
+            timeout = self._config_float("carla_connect_timeout_seconds", 30.0)
+        else:
+            timeout = self._config_float("max_retry_times", 15.0) * 2
+        retry_interval = self._config_float("retry_interval_seconds", 2.0)
+        if timeout <= 0:
+            raise InvalidAvRequest("carla_connect_timeout_seconds must be positive")
+        if retry_interval <= 0:
+            raise InvalidAvRequest("retry_interval_seconds must be positive")
         end_time = time.time() + timeout
 
         while self._server_version is None:
@@ -170,18 +177,29 @@ class CarlaAgentAV:
         if pos is None:
             return 0.0
         if hasattr(pos, "yaw"):
-            return float(pos.yaw)
+            try:
+                return float(pos.yaw)
+            except (TypeError, ValueError) as exc:
+                raise InvalidAvRequest(f"Position yaw must be a float, got {pos.yaw!r}") from exc
         world = getattr(pos, "world", None)
         if world is not None and hasattr(world, "h"):
-            return float(world.h)
+            try:
+                return float(world.h)
+            except (TypeError, ValueError) as exc:
+                raise InvalidAvRequest(
+                    f"Position heading must be a float, got {world.h!r}"
+                ) from exc
         if hasattr(pos, "h"):
-            return float(pos.h)
+            try:
+                return float(pos.h)
+            except (TypeError, ValueError) as exc:
+                raise InvalidAvRequest(f"Position heading must be a float, got {pos.h!r}") from exc
         return 0.0
 
     def _to_carla_location(self, pos) -> Any:
         try:
             x, y, z = self._extract_xyz(pos)
-        except Exception as exc:
+        except ValueError as exc:
             raise ValueError(f"Failed to convert position to CARLA location: {pos!r}") from exc
         y = float(y) * self._coordinate_y_sign
         return self._carla.Location(
@@ -198,25 +216,35 @@ class CarlaAgentAV:
                 speed = ego.target_speed
         if speed is None:
             speed = 0.0
-        speed = float(speed)
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAvRequest(f"target_speed must be a float, got {speed!r}") from exc
         if self._target_speed_is_mps:
             speed = speed * 3.6
         return speed
 
     def _validate_config(self) -> None:
         if self._agent_type not in VALID_AGENT_TYPES:
-            raise ValueError(f"Unsupported CARLA agent_type: {self._agent_type!r}")
+            raise InvalidAvRequest(f"Unsupported CARLA agent_type: {self._agent_type!r}")
         if self._agent_type == "behavior" and self._behavior not in VALID_BEHAVIORS:
-            raise ValueError(
+            raise InvalidAvRequest(
                 f"Unsupported CARLA behavior: {self._behavior!r}. "
                 f"Expected one of: {', '.join(sorted(VALID_BEHAVIORS))}"
             )
 
     def _config_sign(self, name: str, default: float) -> float:
-        value = float(self.config.get(name, default))
+        value = self._config_float(name, default)
         if abs(value) < 1e-6:
-            raise ValueError(f"{name} must be non-zero")
+            raise InvalidAvRequest(f"{name} must be non-zero")
         return 1.0 if value > 0 else -1.0
+
+    def _config_float(self, name: str, default: float) -> float:
+        raw = self.config.get(name, default)
+        try:
+            return float(raw)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAvRequest(f"{name} must be a float, got {raw!r}") from exc
 
     def _build_agent(self, target_speed_kmh: float):
         if self._vehicle is None:
@@ -256,7 +284,7 @@ class CarlaAgentAV:
                 map_inst=self._map,
             )
         else:
-            raise ValueError(f"Unsupported CARLA agent_type: {self._agent_type!r}")
+            raise InvalidAvRequest(f"Unsupported CARLA agent_type: {self._agent_type!r}")
 
         agent.set_target_speed(target_speed_kmh)
         if hasattr(agent, "follow_speed_limits"):
@@ -278,7 +306,7 @@ class CarlaAgentAV:
         local_planner._distance_ratio = self._local_planner_distance_ratio
         local_planner._min_distance = self._local_planner_base_min_distance
 
-    def init(self, request: InitRequest) -> InitResponse | None:
+    def init(self, request: InitRequest) -> None:
         self._output_dir = request.output_dir
         self.config = request.config or {}
         self._fixed_delta_seconds = request.dt
@@ -302,20 +330,18 @@ class CarlaAgentAV:
 
         self._target_speed = self.config.get("target_speed", None)
         self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
-        self._local_planner_base_min_distance = float(
-            self.config.get("local_planner_base_min_distance", 1.0)
+        self._local_planner_base_min_distance = self._config_float(
+            "local_planner_base_min_distance", 1.0
         )
-        self._local_planner_distance_ratio = float(
-            self.config.get("local_planner_distance_ratio", 0.0)
-        )
-        self._route_sampling_resolution = float(self.config.get("route_sampling_resolution", 0.5))
+        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.0)
+        self._route_sampling_resolution = self._config_float("route_sampling_resolution", 0.5)
 
         legacy_yaw_sign = self._config_sign("yaw_sign", -1.0)
         self._coordinate_y_sign = self._config_sign("coordinate_y_sign", legacy_yaw_sign)
         self._yaw_sign = self._config_sign("yaw_sign", legacy_yaw_sign)
         self._steer_sign = self._config_sign("steer_sign", legacy_yaw_sign)
-        self._yaw_offset_deg = float(self.config.get("yaw_offset_deg", 0.0))
-        self._spawn_z_offset = float(self.config.get("spawn_z_offset", 3.0))
+        self._yaw_offset_deg = self._config_float("yaw_offset_deg", 0.0)
+        self._spawn_z_offset = self._config_float("spawn_z_offset", 3.0)
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
         self._reuse_generated_world = bool(self.config.get("reuse_generated_world", True))
         self._traffic_manager_port = int(os.environ.get("CARLA_TM_PORT", 8000))
@@ -323,22 +349,22 @@ class CarlaAgentAV:
             self.config.get("object_identity_mode", "stateless")
         ).lower()
         if self._object_identity_mode not in OBJECT_IDENTITY_MODES:
-            raise ValueError(
+            raise InvalidAvRequest(
                 f"Unsupported object_identity_mode: {self._object_identity_mode!r}. "
                 f"Expected one of: {', '.join(sorted(OBJECT_IDENTITY_MODES))}"
             )
 
         if not self._ensure_connected():
-            return InitResponse(success=False, msg="Failed to connect to CARLA within timeout")
+            raise AvTimeout("Timed out connecting to CARLA")
 
         self._prepare_reused_server_state()
         self._quit_flag = False
-        return InitResponse(success=True, msg="CARLA agent initialized successfully")
+        return None
 
     def reset(
         self,
         request: ResetRequest,
-    ) -> ControlCommand | ResetResponse:
+    ) -> ResetResponse:
         if not self._finalized:
             self._finalize()
 
@@ -352,7 +378,7 @@ class CarlaAgentAV:
 
         try:
             if sps is None:
-                raise RuntimeError("ScenarioPack is required to prepare CARLA agent")
+                raise InvalidAvRequest("ScenarioPack is required to prepare CARLA agent")
             self._ensure_world(sps.map_name)
             self._clear_dynamic_actors()
             self._vehicle = None
@@ -369,25 +395,28 @@ class CarlaAgentAV:
 
             if self._random_destination:
                 if self._map is None:
-                    raise RuntimeError("CARLA map not available for destination picking")
+                    raise InvalidAvRequest("CARLA map not available for destination picking")
                 spawn_points = self._map.get_spawn_points()
                 if not spawn_points:
-                    raise RuntimeError("No spawn points available for random destination")
+                    raise InvalidAvRequest("No spawn points available for random destination")
                 dest = random.choice(spawn_points).location
             else:
                 goal_pos = sps.ego.goal_config.position if sps is not None else None
                 if goal_pos is None:
                     if self._map is None:
-                        raise RuntimeError("Goal position missing and CARLA map not available")
+                        raise InvalidAvRequest("Goal position missing and CARLA map not available")
                     logger.warning(
                         "Goal position missing; using random destination from spawn points."
                     )
                     spawn_points = self._map.get_spawn_points()
                     if not spawn_points:
-                        raise RuntimeError("No spawn points available for destination fallback")
+                        raise InvalidAvRequest("No spawn points available for destination fallback")
                     dest = random.choice(spawn_points).location
                 else:
-                    dest = self._to_carla_location(goal_pos)
+                    try:
+                        dest = self._to_carla_location(goal_pos)
+                    except ValueError as exc:
+                        raise InvalidAvRequest(str(exc)) from exc
             dest.z += self._spawn_z_offset  # to avoid underground issues
 
             start_transform = self._vehicle.get_transform()
@@ -407,20 +436,26 @@ class CarlaAgentAV:
             try:
                 self._agent.set_destination(end_wp.transform.location, start_wp.transform.location)
             except Exception as exc:
-                raise RuntimeError(
+                raise AvPreconditionFailed(
                     f"CARLA agent_type={self._agent_type!r} failed to plan a route. "
                     f"start={self._format_waypoint(start_wp)}, "
                     f"destination={self._format_waypoint(end_wp)}"
                 ) from exc
 
-            return self.step(StepRequest(observation=init_obs if init_obs is not None else []))
-        except Exception:
+            return ResetResponse(
+                ctrl_cmd=self.step(
+                    StepRequest(observation=init_obs if init_obs is not None else [])
+                ).ctrl_cmd
+            )
+        except AvError:
             logger.exception("Failed to reset CARLA agent; finalizing partial state")
             self._finalize()
             raise
 
-    def step(self, request: StepRequest) -> ControlCommand | StepResponse:
+    def step(self, request: StepRequest) -> StepResponse:
         obs = request.observation
+        if not obs:
+            raise InvalidAvRequest("Step observation must include ego state")
         self._update_and_tick(obs)
         if self._agent is None:
             raise RuntimeError("CARLA agent is not initialized")
@@ -430,13 +465,15 @@ class CarlaAgentAV:
             self._quit_flag = True
 
         steer_sv = float(control.steer) / getattr(self, "_steer_sign", 1.0)
-        return ControlCommand(
-            mode=ControlMode.THROTTLE_STEER_BREAK,
-            payload={
-                "throttle": float(control.throttle),
-                "brake": float(control.brake),
-                "steer": steer_sv,
-            },
+        return StepResponse(
+            ctrl_cmd=ControlCommand(
+                mode=ControlMode.THROTTLE_STEER_BREAK,
+                payload={
+                    "throttle": float(control.throttle),
+                    "brake": float(control.brake),
+                    "steer": steer_sv,
+                },
+            )
         )
 
     def stop(self) -> None:
@@ -484,20 +521,23 @@ class CarlaAgentAV:
 
     def _spawn_ego(self, init_obs: list[ObjectStateData] | None, sps: ScenarioPackData):
         if self._world is None:
-            raise RuntimeError("CARLA world not available")
+            raise AvUnavailable("CARLA world not available")
 
         bp_lib = self._world.get_blueprint_library()
         ego_bp = self._find_blueprint(bp_lib, (self._ego_bp_id, "vehicle.*"))
         if ego_bp is None:
-            raise RuntimeError("No vehicle blueprints available in CARLA")
+            raise InvalidAvRequest("No vehicle blueprints available in CARLA")
 
         if ego_bp.has_attribute("role_name"):
             ego_bp.set_attribute("role_name", self._ego_role_name)
 
         pos = self._get_spawn_position(init_obs, sps)
         if pos is None:
-            raise RuntimeError("No spawn position available for ego vehicle")
-        carla_pos = self._to_carla_location(pos)
+            raise InvalidAvRequest("No spawn position available for ego vehicle")
+        try:
+            carla_pos = self._to_carla_location(pos)
+        except ValueError as exc:
+            raise InvalidAvRequest(str(exc)) from exc
         carla_pos.z += (
             self._spawn_z_offset
         )  # to avoid spawning underground due to map height issues
@@ -512,10 +552,10 @@ class CarlaAgentAV:
             logger.warning("Initial spawn failed, trying spawn points...")
             spawn_points = self._world.get_map().get_spawn_points()
             if not spawn_points:
-                raise RuntimeError("Failed to spawn ego vehicle (no spawn points)")
+                raise AvPreconditionFailed("Failed to spawn ego vehicle (no spawn points)")
             ego = self._world.try_spawn_actor(ego_bp, spawn_points[0])
             if ego is None:
-                raise RuntimeError("Failed to spawn ego vehicle")
+                raise AvPreconditionFailed("Failed to spawn ego vehicle")
         self._spawned_actor_ids.add(ego.id)
 
         try:
@@ -536,10 +576,12 @@ class CarlaAgentAV:
 
     def _snap_to_waypoint(self, location, label: str):
         if self._map is None:
-            raise RuntimeError("CARLA map not available for route planning")
+            raise InvalidAvRequest("CARLA map not available for route planning")
         waypoint = self._map.get_waypoint(location, project_to_road=True)
         if waypoint is None:
-            raise RuntimeError(f"Failed to project {label} location onto CARLA map: {location}")
+            raise AvPreconditionFailed(
+                f"Failed to project {label} location onto CARLA map: {location}"
+            )
         return waypoint
 
     def _format_waypoint(self, waypoint) -> str:
@@ -552,11 +594,11 @@ class CarlaAgentAV:
 
     def _ensure_world(self, map_name: str) -> None:
         if not map_name:
-            raise RuntimeError("ScenarioPack map_name is required to generate CARLA world")
+            raise InvalidAvRequest("ScenarioPack map_name is required to generate CARLA world")
         if self._server_version is None and not self._ensure_connected():
-            raise RuntimeError("Failed to connect to CARLA before loading world")
+            raise AvTimeout("Timed out connecting to CARLA before loading world")
         if self._client is None:
-            raise RuntimeError("CARLA client is not available")
+            raise AvUnavailable("CARLA client is not available")
 
         carla_map_name = None
         opendrive_name = map_name
@@ -578,11 +620,16 @@ class CarlaAgentAV:
         elif opendrive_path and hasattr(self._client, "generate_opendrive_world"):
             opendrive_path = Path(opendrive_path)
             if not opendrive_path.exists():
-                raise RuntimeError("OpenDRIVE path not found for CARLA world generation")
+                raise InvalidAvRequest("OpenDRIVE path not found for CARLA world generation")
 
             # read opendrive file
-            with open(opendrive_path, encoding="utf-8") as f:
-                opendrive_str = f.read()
+            try:
+                with open(opendrive_path, encoding="utf-8") as f:
+                    opendrive_str = f.read()
+            except OSError as exc:
+                raise InvalidAvRequest(
+                    f"Failed to read OpenDRIVE map file: {opendrive_path}"
+                ) from exc
             # OpenDRIVE world generation can take minutes — bump the
             # client timeout, but guarantee it gets restored even if
             # generation raises (otherwise every subsequent CARLA call
@@ -591,28 +638,36 @@ class CarlaAgentAV:
             self._client.set_timeout(300.0)
             try:
                 logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
-                world = self._client.generate_opendrive_world(
-                    opendrive_str,
-                    carla.OpendriveGenerationParameters(
-                        vertex_distance=2.0,
-                        max_road_length=3000.0,
-                        wall_height=0.0,
-                        additional_width=0.6,
-                        smooth_junctions=True,
-                        enable_mesh_visibility=True,
-                    ),
-                )
+                try:
+                    world = self._client.generate_opendrive_world(
+                        opendrive_str,
+                        carla.OpendriveGenerationParameters(
+                            vertex_distance=2.0,
+                            max_road_length=3000.0,
+                            wall_height=0.0,
+                            additional_width=0.6,
+                            smooth_junctions=True,
+                            enable_mesh_visibility=True,
+                        ),
+                    )
+                except Exception as exc:
+                    raise InvalidAvRequest(
+                        f"Failed to generate CARLA world from OpenDRIVE: {opendrive_path}"
+                    ) from exc
                 logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
             finally:
                 self._client.set_timeout(default_timeout)
         else:
-            raise RuntimeError("Cannot determine CARLA world to load")
+            raise InvalidAvRequest("Cannot determine CARLA world to load")
 
         if world is None:
             world = self._client.get_world()
 
         self._world = world
-        self._map = world.get_map()
+        try:
+            self._map = world.get_map()
+        except Exception as exc:
+            raise InvalidAvRequest("Failed to read CARLA map from generated world") from exc
         self._loaded_map_name = map_name
         self._loaded_opendrive_path = opendrive_path
 
@@ -712,7 +767,7 @@ class CarlaAgentAV:
 
         identity = self._provided_object_identity(obj)
         if identity is None:
-            raise RuntimeError(
+            raise InvalidAvRequest(
                 "object_identity_mode='provided' requires each non-ego object to expose one of: "
                 f"{', '.join(OBJECT_IDENTITY_ATTRS)}"
             )
@@ -742,9 +797,10 @@ class CarlaAgentAV:
             if actor is None:
                 return
             try:
-                actor.set_transform(make_transform(kin))
-            except Exception:
-                logger.exception("Failed to set actor transform")
+                transform = make_transform(kin)
+            except ValueError as exc:
+                raise InvalidAvRequest(str(exc)) from exc
+            actor.set_transform(transform)
 
             speed = float(kin.speed)
             yaw_carla_deg = self._to_carla_yaw(float(kin.yaw))
@@ -807,18 +863,17 @@ class CarlaAgentAV:
                         self._spawned_actor_ids.discard(actor_id)
                 bp = self._pick_blueprint(obj_type)
                 if bp is None:
-                    logger.warning("No blueprint for object type %s", obj_type)
-                    self._other_actors_by_key[key] = None
-                    self._other_actor_types_by_key[key] = obj_type
-                    continue
+                    raise InvalidAvRequest(f"No blueprint for object type {obj_type}")
                 if bp.has_attribute("role_name"):
                     bp.set_attribute("role_name", self._role_name_for_object_key(key))
-                transform = make_transform(obj.kinematic, z_offset=self._spawn_z_offset)
+                try:
+                    transform = make_transform(obj.kinematic, z_offset=self._spawn_z_offset)
+                except ValueError as exc:
+                    raise InvalidAvRequest(str(exc)) from exc
                 actor = self._world.try_spawn_actor(bp, transform)
                 if actor is None:
-                    logger.warning("Failed to spawn actor for object %s", key)
-                else:
-                    self._spawned_actor_ids.add(actor.id)
+                    raise AvPreconditionFailed(f"Failed to spawn actor for object {key}")
+                self._spawned_actor_ids.add(actor.id)
                 self._other_actors_by_key[key] = actor
                 self._other_actor_types_by_key[key] = obj_type
 
