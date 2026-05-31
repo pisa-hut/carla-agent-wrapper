@@ -429,8 +429,7 @@ class CarlaAgentAV:
         if hasattr(self._agent, "done") and self._agent.done():
             self._quit_flag = True
 
-        steer_sv = float(control.steer) / self._steer_sign
-
+        steer_sv = float(control.steer) / getattr(self, "_steer_sign", 1.0)
         return ControlCommand(
             mode=ControlMode.THROTTLE_STEER_BREAK,
             payload={
@@ -788,7 +787,7 @@ class CarlaAgentAV:
         ego_state = obs[0].kinematic
         apply_kinematic(self._vehicle, ego_state)
 
-        if self._object_identity_mode == "stateless":
+        if getattr(self, "_object_identity_mode", "stateless") == "stateless":
             self._destroy_other_actors()
 
         observed_keys = set()
