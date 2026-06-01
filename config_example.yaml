@@ -35,6 +35,11 @@ xodr_root: /mnt/map/xodr
 # overwritten between tests.
 reuse_generated_world: true
 
+# Force TrafficManager out of sync mode during cleanup. Leave false unless this
+# wrapper also registers actors with CARLA TrafficManager; enabling it initializes
+# TrafficManager's local map and can emit CARLA C++ cache setup warnings.
+manage_traffic_manager_sync: false
+
 # ---------------------------------------------------------------------------
 # Ego vehicle
 # ---------------------------------------------------------------------------

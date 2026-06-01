@@ -117,7 +117,7 @@ class CarlaAgentAV:
     def _connect(self, timeout: float = 2.0):
         if self._server_version is not None:
             return
-        logger.info("Connecting to CARLA...")
+        logger.debug("Connecting to CARLA...")
         self._client = carla.Client(
             os.environ.get("CARLA_HOST", "localhost"),
             int(os.environ.get("CARLA_PORT", 2000)),
@@ -127,7 +127,7 @@ class CarlaAgentAV:
             self._server_version = self._client.get_server_version()
         finally:
             self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
-        logger.info("Connected to CARLA")
+        logger.debug("Connected to CARLA")
 
     def _ensure_connected(self) -> bool:
         config = getattr(self, "config", {}) or {}
@@ -265,9 +265,8 @@ class CarlaAgentAV:
                 map_inst=self._map,
             )
             self._configure_local_planner(agent)
-            print(
-                f"Initialized CARLA BehaviorAgent with behavior={self._behavior}, target_speed_kmh={target_speed_kmh}"
-            )
+            logger.info(f"Initialized CARLA BehaviorAgent with behavior={self._behavior}")
+            logger.info(f"Target speed: {target_speed_kmh} km/h")
 
         elif self._agent_type == "basic":
             agent = self._BasicAgent(
@@ -277,7 +276,7 @@ class CarlaAgentAV:
                 map_inst=self._map,
             )
             self._configure_local_planner(agent)
-            print(f"Initialized CARLA BasicAgent with target_speed_kmh={target_speed_kmh}")
+            logger.info(f"Initialized CARLA BasicAgent with target_speed_kmh={target_speed_kmh}")
         elif self._agent_type in ("constant_velocity", "constant-velocity"):
             agent = self._ConstantVelocityAgent(
                 self._vehicle,
@@ -347,6 +346,9 @@ class CarlaAgentAV:
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
         self._reuse_generated_world = bool(self.config.get("reuse_generated_world", True))
         self._traffic_manager_port = int(os.environ.get("CARLA_TM_PORT", 8000))
+        self._manage_traffic_manager_sync = bool(
+            self.config.get("manage_traffic_manager_sync", False)
+        )
         self._object_identity_mode = str(
             self.config.get("object_identity_mode", "stateless")
         ).lower()
@@ -386,7 +388,7 @@ class CarlaAgentAV:
             self._ensure_world(sps.map_name)
             self._clear_dynamic_actors()
             self._vehicle = None
-            logger.info("Ego vehicle found: %s", self._vehicle)
+            logger.debug("Ego vehicle found: %s", self._vehicle)
             if self._vehicle is None:
                 self._vehicle = self._spawn_ego(init_obs, sps)
 
@@ -426,17 +428,19 @@ class CarlaAgentAV:
             start_transform = self._vehicle.get_transform()
             start_wp = self._snap_to_waypoint(start_transform.location, "ego start")
             end_wp = self._snap_to_waypoint(dest, "destination")
-            logger.info(
+            logger.debug(
                 "Route start: %s, yaw: %.3f, snapped to: %s",
                 start_transform.location,
                 self._from_carla_yaw(start_transform.rotation.yaw),
                 start_wp.transform.location,
             )
-            logger.info(
+            logger.debug(
                 "Route destination: %s, snapped to: %s",
                 dest,
                 end_wp.transform.location,
             )
+            logger.info(f"Route start: {start_wp.transform.location}")
+            logger.info(f"Route destination: {end_wp.transform.location}")
             try:
                 self._agent.set_destination(end_wp.transform.location, start_wp.transform.location)
                 self._ensure_route_ends_at_waypoint(end_wp)
@@ -603,7 +607,7 @@ class CarlaAgentAV:
         except Exception:
             self._max_steer_rad = None
 
-        logger.info("Ego vehicle spawned at %s with yaw %.3f", carla_pos, self._extract_yaw(pos))
+        logger.debug("Ego vehicle spawned at %s with yaw %.3f", carla_pos, self._extract_yaw(pos))
         return ego
 
     def _to_carla_yaw(self, yaw_rad: float) -> float:
@@ -648,7 +652,7 @@ class CarlaAgentAV:
             and self._loaded_map_name == map_name
             and self._loaded_opendrive_path == opendrive_path
         ):
-            logger.info("Reusing generated CARLA world for OpenDRIVE map: %s", opendrive_path)
+            logger.debug("Reusing generated CARLA world for OpenDRIVE map: %s", opendrive_path)
             self._map = self._world.get_map()
             return
 
@@ -675,7 +679,7 @@ class CarlaAgentAV:
             default_timeout = float(os.environ.get("CARLA_TIMEOUT", 10.0))
             self._client.set_timeout(300.0)
             try:
-                logger.info("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
+                logger.debug("Generating CARLA world from OpenDRIVE: %s", opendrive_path)
                 try:
                     world = self._client.generate_opendrive_world(
                         opendrive_str,
@@ -692,7 +696,7 @@ class CarlaAgentAV:
                     raise InvalidAvRequest(
                         f"Failed to generate CARLA world from OpenDRIVE: {opendrive_path}"
                     ) from exc
-                logger.info("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
+                logger.debug("Generated CARLA world from OpenDRIVE: %s", opendrive_path)
             finally:
                 self._client.set_timeout(default_timeout)
         else:
@@ -729,6 +733,7 @@ class CarlaAgentAV:
             self._world,
             client=self._client,
             traffic_manager_port=getattr(self, "_traffic_manager_port", 8000),
+            manage_traffic_manager=getattr(self, "_manage_traffic_manager_sync", False),
             log=logger,
         )
 
@@ -761,11 +766,11 @@ class CarlaAgentAV:
             return
         settings = self._world.get_settings()
         settings.synchronous_mode = self._sync
-        logger.info("Synchronous mode = %s", settings.synchronous_mode)
+        logger.debug("Synchronous mode = %s", settings.synchronous_mode)
         settings.no_rendering_mode = self._no_rendering
-        logger.info("No rendering mode = %s", settings.no_rendering_mode)
+        logger.debug("No rendering mode = %s", settings.no_rendering_mode)
         if self._fixed_delta_seconds is not None:
-            logger.info("Setting fixed_delta_seconds = %s", self._fixed_delta_seconds)
+            logger.debug("Setting fixed_delta_seconds = %s", self._fixed_delta_seconds)
             settings.fixed_delta_seconds = float(self._fixed_delta_seconds)
         self._world.apply_settings(settings)
 
@@ -1003,6 +1008,7 @@ class CarlaAgentAV:
             self._world,
             client=self._client,
             traffic_manager_port=getattr(self, "_traffic_manager_port", 8000),
+            manage_traffic_manager=getattr(self, "_manage_traffic_manager_sync", False),
             log=logger,
         )
 

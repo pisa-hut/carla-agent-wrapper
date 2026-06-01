@@ -21,6 +21,7 @@ def force_async_world_for_cleanup(
     *,
     client: Any = None,
     traffic_manager_port: int = 8000,
+    manage_traffic_manager: bool = False,
     log: logging.Logger = logger,
 ) -> None:
     if world is None:
@@ -37,11 +38,11 @@ def force_async_world_for_cleanup(
             changed = True
         if changed:
             world.apply_settings(settings)
-            log.info("Forced CARLA world to async mode for cleanup")
+            log.debug("Forced CARLA world to async mode for cleanup")
     except Exception:
         log.exception("Failed to force CARLA world to async mode for cleanup")
 
-    if client is None:
+    if client is None or not manage_traffic_manager:
         return
 
     try:
@@ -55,6 +56,7 @@ def clear_dynamic_actors(
     *,
     client: Any = None,
     traffic_manager_port: int = 8000,
+    manage_traffic_manager: bool = False,
     log: logging.Logger = logger,
 ) -> int:
     if world is None:
@@ -64,6 +66,7 @@ def clear_dynamic_actors(
         world,
         client=client,
         traffic_manager_port=traffic_manager_port,
+        manage_traffic_manager=manage_traffic_manager,
         log=log,
     )
 

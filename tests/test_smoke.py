@@ -251,13 +251,30 @@ def test_clear_dynamic_actors_only_destroys_runtime_actor_types() -> None:
     assert world.settings.synchronous_mode is False
     assert world.settings.fixed_delta_seconds is None
     assert world.applied_settings is world.settings
-    assert traffic_manager.sync_calls == [False]
+    assert traffic_manager.sync_calls == []
     assert vehicle.destroy_calls == 1
     assert walker.destroy_calls == 1
     assert controller.destroy_calls == 1
     assert sensor.destroy_calls == 1
     assert traffic_light.destroy_calls == 0
     assert static_prop.destroy_calls == 0
+
+
+def test_clear_dynamic_actors_can_manage_traffic_manager_when_enabled() -> None:
+    from carla_agent_wrapper.lifecycle import clear_dynamic_actors
+
+    world = _FakeWorld([], synchronous_mode=True, fixed_delta_seconds=0.05)
+    traffic_manager = _FakeTrafficManager()
+    client = _FakeClient(world, traffic_manager=traffic_manager)
+
+    clear_dynamic_actors(
+        world,
+        client=client,
+        traffic_manager_port=8000,
+        manage_traffic_manager=True,
+    )
+
+    assert traffic_manager.sync_calls == [False]
 
 
 def test_destroy_actor_treats_false_return_as_failure() -> None:
