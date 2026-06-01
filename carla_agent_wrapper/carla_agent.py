@@ -816,6 +816,45 @@ class CarlaAgentAV:
         safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in raw)
         return f"agent_{safe}"[:255]
 
+    def _spawn_actor_allowing_observation_overlap(self, blueprint, transform):
+        if self._world is None:
+            return None
+
+        actor = self._world.try_spawn_actor(blueprint, transform)
+        if actor is not None:
+            return actor
+
+        base_loc = transform.location
+        rotation = transform.rotation
+        retry_offsets = (
+            max(float(getattr(self, "_spawn_z_offset", 0.0)), 5.0),
+            10.0,
+            20.0,
+            50.0,
+        )
+        tried_z = {round(float(base_loc.z), 6)}
+        for offset in retry_offsets:
+            spawn_z = float(base_loc.z) + offset
+            if round(spawn_z, 6) in tried_z:
+                continue
+            tried_z.add(round(spawn_z, 6))
+            elevated_transform = self._carla.Transform(
+                self._carla.Location(base_loc.x, base_loc.y, spawn_z),
+                rotation,
+            )
+            actor = self._world.try_spawn_actor(blueprint, elevated_transform)
+            if actor is not None:
+                return actor
+        return None
+
+    def _make_observation_actor_kinematic(self, actor) -> None:
+        if actor is None:
+            return
+        with contextlib.suppress(Exception):
+            actor.set_simulate_physics(False)
+        with contextlib.suppress(Exception):
+            actor.set_enable_gravity(False)
+
     def _update_and_tick(self, obs: list[ObjectStateData]) -> None:
         if self._world is None:
             return
@@ -831,9 +870,11 @@ class CarlaAgentAV:
             )
             return self._carla.Transform(loc, rot)
 
-        def apply_kinematic(actor, kin) -> None:
+        def apply_kinematic(actor, kin, *, make_kinematic: bool = False) -> None:
             if actor is None:
                 return
+            if make_kinematic:
+                self._make_observation_actor_kinematic(actor)
             try:
                 transform = make_transform(kin)
             except ValueError as exc:
@@ -908,14 +949,18 @@ class CarlaAgentAV:
                     transform = make_transform(obj.kinematic, z_offset=self._spawn_z_offset)
                 except ValueError as exc:
                     raise InvalidAvRequest(str(exc)) from exc
-                actor = self._world.try_spawn_actor(bp, transform)
+                actor = self._spawn_actor_allowing_observation_overlap(bp, transform)
                 if actor is None:
                     raise AvPreconditionFailed(f"Failed to spawn actor for object {key}")
                 self._spawned_actor_ids.add(actor.id)
                 self._other_actors_by_key[key] = actor
                 self._other_actor_types_by_key[key] = obj_type
 
-            apply_kinematic(self._other_actors_by_key.get(key), obj.kinematic)
+            apply_kinematic(
+                self._other_actors_by_key.get(key),
+                obj.kinematic,
+                make_kinematic=True,
+            )
 
         for key in set(self._other_actors_by_key) - observed_keys:
             actor = self._other_actors_by_key.pop(key)

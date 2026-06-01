@@ -109,6 +109,18 @@ class _FakeActorWorld(_FakeWorld):
         self.tick_calls += 1
 
 
+class _FailFirstSpawnWorld(_FakeActorWorld):
+    def __init__(self, blueprints):
+        super().__init__(blueprints)
+        self.spawn_attempts = []
+
+    def try_spawn_actor(self, blueprint, transform):
+        self.spawn_attempts.append(transform)
+        if len(self.spawn_attempts) == 1:
+            return None
+        return super().try_spawn_actor(blueprint, transform)
+
+
 class _FakeActor:
     def __init__(self, actor_id, type_id="vehicle.test"):
         self.id = actor_id
@@ -129,9 +141,17 @@ class _FakeMovingActor(_FakeActor):
     def __init__(self, actor_id, type_id="vehicle.test"):
         super().__init__(actor_id, type_id)
         self.transforms = []
+        self.simulate_physics_calls = []
+        self.enable_gravity_calls = []
 
     def set_transform(self, transform):
         self.transforms.append(transform)
+
+    def set_simulate_physics(self, enabled):
+        self.simulate_physics_calls.append(enabled)
+
+    def set_enable_gravity(self, enabled):
+        self.enable_gravity_calls.append(enabled)
 
     def set_target_velocity(self, velocity):
         self.velocity = velocity
@@ -559,6 +579,46 @@ def test_stateless_identity_mode_recreates_actors_each_step(carla_agent_module) 
 
     assert len(world.spawned) == 2
     assert adapter._other_actors_by_key[("frame", 0)] is not first_actor
+
+
+def test_spawn_retries_above_observation_when_initial_spawn_collides(
+    carla_agent_module,
+) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    bp = _FakeBlueprint()
+    world = _FailFirstSpawnWorld(_FakeBlueprintLibrary(filter_results={"vehicle.*": [bp]}))
+    adapter._world = world
+    adapter._object_identity_mode = "index"
+    adapter._spawn_z_offset = 0.0
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+
+    adapter._update_and_tick([ego, obj])
+
+    actor = adapter._other_actors_by_key[("index", 0)]
+    assert len(world.spawn_attempts) == 2
+    assert world.spawn_attempts[0].location.z == 0.0
+    assert world.spawn_attempts[1].location.z == 5.0
+    assert actor.transforms[-1].location.z == 0.0
+
+
+def test_only_non_ego_observation_actors_are_kinematic_before_tick(
+    carla_agent_module,
+) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    adapter._object_identity_mode = "index"
+    ego_actor = adapter._vehicle
+    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
+    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+
+    adapter._update_and_tick([ego, obj])
+
+    other_actor = adapter._other_actors_by_key[("index", 0)]
+    assert ego_actor.simulate_physics_calls == []
+    assert ego_actor.enable_gravity_calls == []
+    assert other_actor.simulate_physics_calls[-1] is False
+    assert other_actor.enable_gravity_calls[-1] is False
+    assert world.tick_calls == 1
 
 
 def test_provided_identity_mode_requires_object_id(carla_agent_module) -> None:
