@@ -8,8 +8,15 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      # AUTO_FORMAT_TOKEN re-triggers CI on the auto-format commit
+      # (default GITHUB_TOKEN pushes don't, by GitHub policy).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.AUTO_FORMAT_TOKEN }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -17,6 +24,19 @@ jobs:
         with:
           python-version: "3.10"
       - run: uv sync --locked --all-groups
+      - name: Auto-format (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          uv run ruff format
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "chore: ruff format"
+            git push
+            echo "Auto-formatted; a fresh CI run will continue."
+            exit 0
+          fi
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run pytest -x
