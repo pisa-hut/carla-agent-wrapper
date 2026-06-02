@@ -137,7 +137,10 @@ jobs:
             [ "$attempt" = "3" ] && exit 1
           done
 
+          # OCI tags disallow '/'; slugify the same way docker/metadata-action
+          # does for type=ref,event=branch so feature-branch dispatches work.
           REF_TAG="${{ github.ref_name }}"
+          REF_TAG="${REF_TAG//\//-}"
           apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             apptainer push wrapper.sif "oras://${SIF_REPO}:latest"
