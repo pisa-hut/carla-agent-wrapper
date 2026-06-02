@@ -15,18 +15,19 @@ on:
   workflow_dispatch:
 
 env:
-  # Use docker.io for Docker Hub if empty
-  REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
+  REGISTRY: docker.io
 
 jobs:
   build:
     runs-on: self-hosted
 
+    env:
+      # <dockerhub-namespace>/<repo-name>; namespace comes from the
+      # DOCKERHUB_USERNAME secret so the workflow works across forks.
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+
     permissions:
       contents: read
-      packages: write
       # This is used to complete the identity challenge
       # with sigstore/fulcio when running outside of PRs.
       id-token: write
@@ -56,8 +57,8 @@ jobs:
         uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
@@ -77,8 +78,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          # Buildcache push needs registry auth, which is skipped on PR runs;
+          # disable cache I/O on PRs so the sanity build succeeds without creds.
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
 
       # Sign the resulting Docker image digest except on PRs.
       # This will only write to the public Rekor transparency log when the Docker
@@ -95,10 +98,10 @@ jobs:
         # against the sigstore community Fulcio instance.
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
 
-      # ─── Apptainer SIF build + push (oras://ghcr.io/<repo>-sif) ────────
+      # ─── Apptainer SIF build + push (oras://docker.io/<ns>/<repo>-sif) ─
       # Builds the SIF from the docker image we just pushed (pinned by
       # digest so we ship the exact bits), then pushes to a SIF-specific
-      # oras package. Self-hosted runner is assumed to have apptainer
+      # Docker Hub repo. Self-hosted runner is assumed to have apptainer
       # pre-installed (controller node ships with it for the existing
       # ansible flow).
       - name: Build and push Apptainer SIF
@@ -119,14 +122,17 @@ jobs:
           bash /app/entrypoint.sh
           EOD
 
-          echo "${{ secrets.GITHUB_TOKEN }}" | apptainer remote login \
-            --username "${{ github.actor }}" --password-stdin \
-            "oras://${{ env.REGISTRY }}"
+          # Reuse the docker config that docker/login-action populated for the
+          # image push — apptainer's own `registry login` / `remote login` don't
+          # propagate creds to the OCI push code path on Docker Hub. Setting
+          # REGISTRY_AUTH_FILE makes the containers/image library that apptainer
+          # delegates to look at the same file the docker push used.
+          export REGISTRY_AUTH_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
 
-          # 3 retries: the OCI layer fetch from ghcr.io can hit
-          # transient `connection reset by peer` on the multi-GB
-          # layers. Apptainer's OCI cache keeps already-fetched
-          # layers across attempts, so retries are cheap.
+          # 3 retries: the OCI layer fetch can hit transient
+          # `connection reset by peer` on the multi-GB layers.
+          # Apptainer's OCI cache keeps already-fetched layers
+          # across attempts, so retries are cheap.
           for attempt in 1 2 3; do
             if apptainer build wrapper.sif apptainer.def; then
               break
@@ -136,7 +142,10 @@ jobs:
             [ "$attempt" = "3" ] && exit 1
           done
 
+          # OCI tags disallow '/'; slugify the same way docker/metadata-action
+          # does for type=ref,event=branch so feature-branch dispatches work.
           REF_TAG="${{ github.ref_name }}"
+          REF_TAG="${REF_TAG//\//-}"
           apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             apptainer push wrapper.sif "oras://${SIF_REPO}:latest"
