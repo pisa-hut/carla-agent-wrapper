@@ -94,3 +94,40 @@ jobs:
         # This step uses the identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+      # ─── Apptainer SIF build + push (oras://ghcr.io/<repo>-sif) ────────
+      # Builds the SIF from the docker image we just pushed (pinned by
+      # digest so we ship the exact bits), then pushes to a SIF-specific
+      # oras package. Self-hosted runner is assumed to have apptainer
+      # pre-installed (controller node ships with it for the existing
+      # ansible flow).
+      - name: Build and push Apptainer SIF
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SIF_REPO="$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-sif' | tr '[:upper:]' '[:lower:]')"
+          DOCKER_PINNED="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+
+          cat > apptainer.def <<EOD
+          Bootstrap: docker
+          From: ${DOCKER_PINNED}
+
+          %startscript
+          #!/bin/bash
+          bash /app/entrypoint.sh
+          EOD
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | apptainer remote login \
+            --username "${{ github.actor }}" --password-stdin \
+            "oras://${{ env.REGISTRY }}"
+
+          apptainer build wrapper.sif apptainer.def
+
+          REF_TAG="${{ github.ref_name }}"
+          apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            apptainer push wrapper.sif "oras://${SIF_REPO}:latest"
+          fi
+          echo "SIF pushed: oras://${SIF_REPO}:${REF_TAG}"
