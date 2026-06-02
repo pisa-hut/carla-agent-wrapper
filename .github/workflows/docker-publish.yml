@@ -123,7 +123,18 @@ jobs:
             --username "${{ github.actor }}" --password-stdin \
             "oras://${{ env.REGISTRY }}"
 
-          apptainer build wrapper.sif apptainer.def
+          # 3 retries: the OCI layer fetch from ghcr.io can hit
+          # transient `connection reset by peer` on the multi-GB
+          # layers. Apptainer's OCI cache keeps already-fetched
+          # layers across attempts, so retries are cheap.
+          for attempt in 1 2 3; do
+            if apptainer build wrapper.sif apptainer.def; then
+              break
+            fi
+            echo "apptainer build attempt $attempt failed; retrying"
+            sleep 5
+            [ "$attempt" = "3" ] && exit 1
+          done
 
           REF_TAG="${{ github.ref_name }}"
           apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
