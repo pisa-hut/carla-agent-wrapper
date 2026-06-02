@@ -120,13 +120,12 @@ jobs:
           bash /app/entrypoint.sh
           EOD
 
-          # Use `registry login` (modern OCI-specific command) not `remote login`.
-          # Docker Hub's auth flow doesn't pick up creds stored by `remote login`
-          # the way ghcr.io did; `registry login docker://...` stores them where
-          # the subsequent oras push will actually find them.
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | apptainer registry login \
-            --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin \
-            "docker://${{ env.REGISTRY }}"
+          # Reuse the docker config that docker/login-action populated for the
+          # image push — apptainer's own `registry login` / `remote login` don't
+          # propagate creds to the OCI push code path on Docker Hub. Setting
+          # REGISTRY_AUTH_FILE makes the containers/image library that apptainer
+          # delegates to look at the same file the docker push used.
+          export REGISTRY_AUTH_FILE="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
 
           # 3 retries: the OCI layer fetch can hit transient
           # `connection reset by peer` on the multi-GB layers.
