@@ -147,7 +147,4 @@ jobs:
           REF_TAG="${{ github.ref_name }}"
           REF_TAG="${REF_TAG//\//-}"
           apptainer push wrapper.sif "oras://${SIF_REPO}:${REF_TAG}"
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            apptainer push wrapper.sif "oras://${SIF_REPO}:latest"
-          fi
           echo "SIF pushed: oras://${SIF_REPO}:${REF_TAG}"
