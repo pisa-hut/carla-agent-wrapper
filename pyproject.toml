@@ -14,7 +14,7 @@ dependencies = [
     "opencv-python==4.7.0.72",
     "psutil>=7.2.2",
     "py-trees==0.8.3",
-    "pisa-api>=0.3.0",
+    "pisa-api>=0.4.0",
     "shapely==2.1.1",
     "simple-watchdog-timer>=0.1.1",
     "six>=1.17.0",
@@ -26,7 +26,7 @@ dependencies = [
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.uv.sources]
-pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git" }
+pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git", rev = "709d811" }
 
 [tool.ruff]
 line-length = 100

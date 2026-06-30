@@ -50,7 +50,7 @@ requires-dist = [
     { name = "networkx", specifier = "==3.4.2" },
     { name = "numpy", marker = "python_full_version >= '3'", specifier = "==1.24.4" },
     { name = "opencv-python", specifier = "==4.7.0.72" },
-    { name = "pisa-api", git = "https://github.com/pisa-hut/pisa-api.git" },
+    { name = "pisa-api", git = "https://github.com/pisa-hut/pisa-api.git?rev=709d811" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "py-trees", specifier = "==0.8.3" },
     { name = "shapely", specifier = "==2.1.1" },
@@ -329,8 +329,8 @@ wheels = [
 
 [[package]]
 name = "pisa-api"
-version = "0.3.1"
-source = { git = "https://github.com/pisa-hut/pisa-api.git#2d033c68e273716675ca4a02d25ac6698ea49314" }
+version = "0.4.0"
+source = { git = "https://github.com/pisa-hut/pisa-api.git?rev=709d811#709d811ee605ffe84f5a34de98710bca10dfd611" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },

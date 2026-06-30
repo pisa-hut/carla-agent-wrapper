@@ -126,20 +126,6 @@ steer_sign: -1.0
 yaw_offset_deg: 0.0
 
 # ---------------------------------------------------------------------------
-# Non-ego object lifecycle
-# ---------------------------------------------------------------------------
-
-# How the wrapper associates incoming non-ego observations with CARLA actors.
-# Supported values:
-# - index: Use object list order as identity. Fastest; requires the simulator
-#          to keep non-ego object ordering stable across steps.
-# - provided: Use id/object_id/track_id/external_id/name attributes if present.
-#             Raises an error if an object lacks a provided identity.
-# - stateless: Destroy and recreate non-ego actors every step. Most conservative
-#              but least efficient.
-object_identity_mode: stateless
-
-# ---------------------------------------------------------------------------
 # Environment variables used outside request.config
 # ---------------------------------------------------------------------------
 # These are not read from request.config; set them in the container/runtime env.

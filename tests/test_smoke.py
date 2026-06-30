@@ -3,6 +3,15 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from pisa_api.av import (
+    ObjectKinematicData,
+    ObjectStateData,
+    ObservationData,
+    ObservedAgentData,
+    ShapeCenterPoseData,
+    ShapeData,
+    ShapeType,
+)
 
 
 class _FakeTrafficManager:
@@ -143,6 +152,10 @@ class _FakeMovingActor(_FakeActor):
         self.transforms = []
         self.simulate_physics_calls = []
         self.enable_gravity_calls = []
+        self.bounding_box = SimpleNamespace(
+            location=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            rotation=SimpleNamespace(roll=0.0, pitch=0.0, yaw=0.0),
+        )
 
     def set_transform(self, transform):
         self.transforms.append(transform)
@@ -296,7 +309,7 @@ def test_reset_does_not_wrap_unclassified_runtime_error(carla_agent_module) -> N
     request = SimpleNamespace(
         output_dir="run",
         scenario_pack=SimpleNamespace(map_name="Town01"),
-        initial_observation=[],
+        initial_observation=carla_agent_module.ObservationData(),
     )
 
     with pytest.raises(RuntimeError, match="world failed"):
@@ -317,7 +330,7 @@ def test_reset_finalizes_partial_state_for_classified_av_error(carla_agent_modul
     request = SimpleNamespace(
         output_dir="run",
         scenario_pack=SimpleNamespace(map_name="Town01"),
-        initial_observation=[],
+        initial_observation=carla_agent_module.ObservationData(),
     )
 
     with pytest.raises(carla_agent_module.InvalidAvRequest, match="bad scenario"):
@@ -386,11 +399,12 @@ def test_route_is_forced_to_end_at_destination_waypoint(carla_agent_module) -> N
 
 def test_step_returns_step_response(carla_agent_module) -> None:
     adapter, world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "stateless"
     adapter._agent = _FakeAgent()
     ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
 
-    response = adapter.step(SimpleNamespace(observation=[ego]))
+    response = adapter.step(
+        SimpleNamespace(observation=carla_agent_module.ObservationData(ego=ego))
+    )
 
     assert isinstance(response, carla_agent_module.StepResponse)
     assert response.ctrl_cmd.payload["throttle"] == pytest.approx(0.0)
@@ -402,7 +416,7 @@ def test_step_rejects_missing_ego_state(carla_agent_module) -> None:
     adapter._agent = _FakeAgent()
 
     with pytest.raises(carla_agent_module.InvalidAvRequest, match="ego state"):
-        adapter.step(SimpleNamespace(observation=[]))
+        adapter.step(SimpleNamespace(observation=None))
 
 
 def test_should_quit_returns_response(carla_agent_module) -> None:
@@ -419,11 +433,10 @@ def test_should_quit_returns_response(carla_agent_module) -> None:
 
 def test_step_sets_destination_reached_quit_message(carla_agent_module) -> None:
     adapter, _world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "stateless"
     adapter._agent = _DoneAgent()
     ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
 
-    adapter.step(SimpleNamespace(observation=[ego]))
+    adapter.step(SimpleNamespace(observation=carla_agent_module.ObservationData(ego=ego)))
     response = adapter.should_quit()
 
     assert response.should_quit is True
@@ -437,7 +450,7 @@ def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:
     ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
 
     with pytest.raises(RuntimeError, match="Ego vehicle not found"):
-        adapter.step(SimpleNamespace(observation=[ego]))
+        adapter.step(SimpleNamespace(observation=carla_agent_module.ObservationData(ego=ego)))
 
 
 def test_route_failure_is_concrete_precondition_failure(carla_agent_module) -> None:
@@ -486,7 +499,11 @@ def test_route_failure_is_concrete_precondition_failure(carla_agent_module) -> N
 
     with pytest.raises(carla_agent_module.AvPreconditionFailed, match="failed to plan"):
         adapter.reset(
-            SimpleNamespace(output_dir="run", scenario_pack=sps, initial_observation=[ego])
+            SimpleNamespace(
+                output_dir="run",
+                scenario_pack=sps,
+                initial_observation=carla_agent_module.ObservationData(ego=ego),
+            )
         )
 
 
@@ -543,6 +560,7 @@ def _make_tracking_adapter(carla_agent_module):
     adapter._other_actor_types = []
     adapter._other_actors_by_key = {}
     adapter._other_actor_types_by_key = {}
+    adapter._using_tracking_ids = False
     return adapter, world
 
 
@@ -550,52 +568,142 @@ def _kinematic(x):
     return SimpleNamespace(x=x, y=0.0, z=0.0, yaw=0.0, speed=0.0, yaw_rate=0.0)
 
 
-def test_index_identity_mode_reuses_actors_when_order_is_stable(carla_agent_module) -> None:
-    adapter, world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "index"
-    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
-    obj_a = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
-    obj_b = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(2.0))
+def _state(carla_agent_module, x, *, shape=None):
+    return ObjectStateData(
+        type=carla_agent_module.RoadObjectType.CAR,
+        kinematic=ObjectKinematicData(
+            x=x,
+            y=0.0,
+            z=0.0,
+            yaw=0.0,
+            speed=0.0,
+            yaw_rate=0.0,
+        ),
+        shape=shape,
+    )
 
-    adapter._update_and_tick([ego, obj_a, obj_b])
+
+def _observation(carla_agent_module, agents=(), *, ego_x=0.0):
+    return ObservationData(ego=_state(carla_agent_module, ego_x), agents=list(agents))
+
+
+def _agent(carla_agent_module, x, *, tracking_id=None, entity_name=None, shape=None):
+    return ObservedAgentData(
+        state=_state(carla_agent_module, x, shape=shape),
+        tracking_id=tracking_id,
+        entity_name=entity_name,
+    )
+
+
+def test_tracking_ids_preserve_actor_identity_when_order_changes(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    obj_a = _agent(carla_agent_module, 1.0, tracking_id=0)
+    obj_b = _agent(carla_agent_module, 2.0, tracking_id=22)
+
+    adapter._update_and_tick(_observation(carla_agent_module, [obj_a, obj_b]))
     first_actors = dict(adapter._other_actors_by_key)
-    adapter._update_and_tick([ego, obj_a, obj_b])
+    adapter._update_and_tick(_observation(carla_agent_module, [obj_b, obj_a]))
 
     assert len(world.spawned) == 2
+    assert set(first_actors) == {0, 22}
     assert adapter._other_actors_by_key == first_actors
 
 
-def test_provided_identity_mode_uses_stable_identity_when_order_changes(carla_agent_module) -> None:
+def test_missing_tracking_ids_recreate_actors_without_index_identity(carla_agent_module) -> None:
     adapter, world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "provided"
+    obj_a = _agent(carla_agent_module, 1.0)
+    obj_b = _agent(carla_agent_module, 2.0)
 
-    def kin(x):
-        return _kinematic(x)
+    adapter._update_and_tick(_observation(carla_agent_module, [obj_a, obj_b]))
+    first_actors = list(adapter._other_actors)
+    adapter._update_and_tick(_observation(carla_agent_module, [obj_b, obj_a]))
 
-    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=kin(0.0))
-    obj_a = SimpleNamespace(id="a", type=carla_agent_module.RoadObjectType.CAR, kinematic=kin(1.0))
-    obj_b = SimpleNamespace(id="b", type=carla_agent_module.RoadObjectType.CAR, kinematic=kin(2.0))
+    assert len(world.spawned) == 4
+    assert adapter._other_actors_by_key == {}
+    assert all(actor.destroy_calls == 1 for actor in first_actors)
 
-    adapter._update_and_tick([ego, obj_a, obj_b])
-    first_actors = dict(adapter._other_actors_by_key)
-    adapter._update_and_tick([ego, obj_b, obj_a])
+
+def test_mixed_tracking_ids_use_stateless_behavior(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    tracked = _agent(carla_agent_module, 1.0, tracking_id=10)
+    untracked = _agent(carla_agent_module, 2.0)
+
+    adapter._update_and_tick(_observation(carla_agent_module, [tracked, untracked]))
+    adapter._update_and_tick(_observation(carla_agent_module, [untracked, tracked]))
+
+    assert len(world.spawned) == 4
+    assert adapter._other_actors_by_key == {}
+
+
+def test_missing_id_frame_removes_previously_tracked_actors(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    adapter._update_and_tick(
+        _observation(carla_agent_module, [_agent(carla_agent_module, 1.0, tracking_id=10)])
+    )
+    tracked_actor = adapter._other_actors_by_key[10]
+
+    adapter._update_and_tick(_observation(carla_agent_module, [_agent(carla_agent_module, 2.0)]))
 
     assert len(world.spawned) == 2
-    assert adapter._other_actors_by_key == first_actors
+    assert tracked_actor.destroy_calls == 1
+    assert adapter._other_actors_by_key == {}
 
 
-def test_stateless_identity_mode_recreates_actors_each_step(carla_agent_module) -> None:
+def test_tracking_ids_create_new_and_remove_disappeared_actors(carla_agent_module) -> None:
     adapter, world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "stateless"
-    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
-    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+    first = _agent(carla_agent_module, 1.0, tracking_id=10)
+    added = _agent(carla_agent_module, 2.0, tracking_id=20)
 
-    adapter._update_and_tick([ego, obj])
-    first_actor = adapter._other_actors_by_key[("frame", 0)]
-    adapter._update_and_tick([ego, obj])
+    adapter._update_and_tick(_observation(carla_agent_module, [first]))
+    first_actor = adapter._other_actors_by_key[10]
+    adapter._update_and_tick(_observation(carla_agent_module, [added]))
 
     assert len(world.spawned) == 2
-    assert adapter._other_actors_by_key[("frame", 0)] is not first_actor
+    assert first_actor.destroy_calls == 1
+    assert set(adapter._other_actors_by_key) == {20}
+
+
+def test_tracking_id_type_change_replaces_actor(carla_agent_module) -> None:
+    adapter, world = _make_tracking_adapter(carla_agent_module)
+    original = _agent(carla_agent_module, 1.0, tracking_id=10)
+    replacement = ObservedAgentData(
+        state=ObjectStateData(
+            type=carla_agent_module.RoadObjectType.PEDESTRIAN,
+            kinematic=ObjectKinematicData(x=1.0),
+        ),
+        tracking_id=10,
+    )
+    world.blueprints.filter_results["walker.pedestrian.*"] = [_FakeBlueprint()]
+
+    adapter._update_and_tick(_observation(carla_agent_module, [original]))
+    original_actor = adapter._other_actors_by_key[10]
+    adapter._update_and_tick(_observation(carla_agent_module, [replacement]))
+
+    assert len(world.spawned) == 2
+    assert original_actor.destroy_calls == 1
+    assert adapter._other_actor_types_by_key[10] == carla_agent_module.RoadObjectType.PEDESTRIAN
+
+
+def test_duplicate_tracking_ids_are_rejected(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    agents = [
+        _agent(carla_agent_module, 1.0, tracking_id=7),
+        _agent(carla_agent_module, 2.0, tracking_id=7),
+    ]
+
+    with pytest.raises(carla_agent_module.InvalidAvRequest, match="duplicate"):
+        adapter._update_and_tick(_observation(carla_agent_module, agents))
+
+
+def test_entity_names_are_optional_and_not_used_as_identity(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    named = _agent(carla_agent_module, 1.0, entity_name="NPC")
+    unnamed = _agent(carla_agent_module, 2.0)
+
+    adapter._update_and_tick(_observation(carla_agent_module, [named, unnamed]))
+
+    assert len(adapter._other_actors) == 2
+    assert adapter._other_actors_by_key == {}
 
 
 def test_spawn_retries_above_observation_when_initial_spawn_collides(
@@ -605,14 +713,12 @@ def test_spawn_retries_above_observation_when_initial_spawn_collides(
     bp = _FakeBlueprint()
     world = _FailFirstSpawnWorld(_FakeBlueprintLibrary(filter_results={"vehicle.*": [bp]}))
     adapter._world = world
-    adapter._object_identity_mode = "index"
     adapter._spawn_z_offset = 0.0
-    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
-    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+    obj = _agent(carla_agent_module, 1.0)
 
-    adapter._update_and_tick([ego, obj])
+    adapter._update_and_tick(_observation(carla_agent_module, [obj]))
 
-    actor = adapter._other_actors_by_key[("index", 0)]
+    actor = adapter._other_actors[0]
     assert len(world.spawn_attempts) == 2
     assert world.spawn_attempts[0].location.z == 0.0
     assert world.spawn_attempts[1].location.z == 5.0
@@ -623,14 +729,12 @@ def test_only_non_ego_observation_actors_are_kinematic_before_tick(
     carla_agent_module,
 ) -> None:
     adapter, world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "index"
     ego_actor = adapter._vehicle
-    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
-    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+    obj = _agent(carla_agent_module, 1.0, tracking_id=1)
 
-    adapter._update_and_tick([ego, obj])
+    adapter._update_and_tick(_observation(carla_agent_module, [obj]))
 
-    other_actor = adapter._other_actors_by_key[("index", 0)]
+    other_actor = adapter._other_actors_by_key[1]
     assert ego_actor.simulate_physics_calls == []
     assert ego_actor.enable_gravity_calls == []
     assert other_actor.simulate_physics_calls[-1] is False
@@ -638,16 +742,52 @@ def test_only_non_ego_observation_actors_are_kinematic_before_tick(
     assert world.tick_calls == 1
 
 
-def test_provided_identity_mode_requires_object_id(carla_agent_module) -> None:
+def test_agent_order_does_not_change_ego_pose(carla_agent_module) -> None:
     adapter, _world = _make_tracking_adapter(carla_agent_module)
-    adapter._object_identity_mode = "provided"
-    ego = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(0.0))
-    obj = SimpleNamespace(type=carla_agent_module.RoadObjectType.CAR, kinematic=_kinematic(1.0))
+    agents = [
+        _agent(carla_agent_module, 1.0, tracking_id=1),
+        _agent(carla_agent_module, 2.0, tracking_id=2),
+    ]
 
-    with pytest.raises(
-        carla_agent_module.InvalidAvRequest, match="object_identity_mode='provided'"
-    ):
-        adapter._update_and_tick([ego, obj])
+    adapter._update_and_tick(_observation(carla_agent_module, agents, ego_x=50.0))
+    adapter._update_and_tick(_observation(carla_agent_module, reversed(agents), ego_x=50.0))
+
+    assert [transform.location.x for transform in adapter._vehicle.transforms] == [50.0, 50.0]
+
+
+def test_bounding_box_center_and_actor_origin_offsets_are_composed(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    shape = ShapeData(
+        type=ShapeType.BOUNDING_BOX,
+        center=ShapeCenterPoseData(x=2.0, y=1.0, z=0.5, yaw=1.5707963267948966),
+        reference_point="rear_axle",
+    )
+    observed = _agent(carla_agent_module, 10.0, tracking_id=9, shape=shape)
+
+    adapter._update_and_tick(_observation(carla_agent_module, [observed]))
+    actor = adapter._other_actors_by_key[9]
+    actor.bounding_box.location = SimpleNamespace(x=0.5, y=0.0, z=0.0)
+    adapter._update_and_tick(_observation(carla_agent_module, [observed]))
+    transform = actor.transforms[-1]
+
+    assert transform.location.x == pytest.approx(12.0)
+    assert transform.location.y == pytest.approx(0.5)
+    assert transform.location.z == pytest.approx(0.5)
+    assert transform.rotation.yaw == pytest.approx(90.0)
+
+
+def test_reset_other_actor_state_clears_tracking(carla_agent_module) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._update_and_tick(
+        _observation(carla_agent_module, [_agent(carla_agent_module, 1.0, tracking_id=4)])
+    )
+
+    adapter._reset_other_actor_state()
+
+    assert adapter._other_actors == []
+    assert adapter._other_actors_by_key == {}
+    assert adapter._spawned_actor_ids == set()
+    assert adapter._using_tracking_ids is False
 
 
 def test_destroy_spawned_actors_handles_none_and_clears_state(carla_agent_module) -> None:
