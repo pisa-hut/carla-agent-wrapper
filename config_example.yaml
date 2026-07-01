@@ -86,13 +86,15 @@ ignore_stop_signs: false
 # Tell the CARLA agent to ignore other vehicles when supported by the agent.
 ignore_vehicles: false
 
-# Optional target speed for the CARLA agent. Use null to read
-# scenario_pack.ego.target_speed, falling back to 0.0 if absent.
+# Optional canonical target speed in m/s. Use null to read
+# scenario_pack.ego.target_speed (also m/s), falling back to 0.0.
 target_speed: null
 
-# Set true when target_speed is provided in m/s. The wrapper converts it to
-# km/h for CARLA agents. Leave false when target_speed is already km/h.
-target_speed_is_mps: false
+# Optional native CARLA override in km/h. Mutually exclusive with target_speed.
+target_speed_kmh: null
+
+# Seed used for random destination selection. Reset restores this seed.
+random_seed: 0
 
 # CARLA GlobalRoutePlanner samples the route at this interval. Smaller values
 # make route planning slower. The wrapper appends the requested destination
@@ -109,17 +111,15 @@ local_planner_distance_ratio: 0.5
 # Coordinate / control conversion
 # ---------------------------------------------------------------------------
 
-# Sign used when converting scenario yaw radians to CARLA yaw degrees.
-# Must be non-zero; positive values are normalized to 1, negative to -1.
+# Canonical-to-CARLA signs are fixed at -1. These deprecated keys remain
+# visible only for migration validation; any other value is rejected.
 yaw_sign: -1.0
 
 # Sign used when converting scenario y coordinates to CARLA y coordinates.
-# Defaults to yaw_sign if omitted. Keep separate when coordinate handedness
-# and yaw handedness differ.
 coordinate_y_sign: -1.0
 
 # Sign used when converting CARLA steer output back to the simulator steer
-# convention. Defaults to yaw_sign if omitted.
+# convention.
 steer_sign: -1.0
 
 # Constant yaw offset, in degrees, added after applying yaw_sign.
