@@ -500,17 +500,13 @@ def test_step_ignores_agent_done_until_ego_is_within_goal_distance(
     adapter._quit_msg = ""
 
     adapter.step(
-        SimpleNamespace(
-            observation=_observation(carla_agent_module, ego_x=7.0), timestamp_ns=0
-        )
+        SimpleNamespace(observation=_observation(carla_agent_module, ego_x=7.0), timestamp_ns=0)
     )
     assert adapter.should_quit().should_quit is False
 
     adapter.step(
         SimpleNamespace(
-            observation=ObservationData(
-                ego=_state(carla_agent_module, 9.5, time_ns=1)
-            ),
+            observation=ObservationData(ego=_state(carla_agent_module, 9.5, time_ns=1)),
             timestamp_ns=1,
         )
     )
@@ -967,9 +963,7 @@ def test_blueprint_matching_uses_nearest_dimensions_and_caches_measurements(
     adapter, _world = _make_tracking_adapter(carla_agent_module)
     far = _FakeBlueprint("vehicle.far", (7.0, 3.0, 2.5))
     near = _FakeBlueprint("vehicle.near", (4.2, 2.1, 1.6))
-    world = _FakeActorWorld(
-        _FakeBlueprintLibrary(filter_results={"vehicle.*": [far, near]})
-    )
+    world = _FakeActorWorld(_FakeBlueprintLibrary(filter_results={"vehicle.*": [far, near]}))
     adapter._world = world
     state = _state(carla_agent_module, 0.0, shape=_box(length=4.0, width=2.0, height=1.5))
 

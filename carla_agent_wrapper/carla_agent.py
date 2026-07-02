@@ -931,9 +931,7 @@ class CarlaAgentAV:
 
     def _candidate_blueprints(self, obj_type: RoadObjectType) -> list[Any]:
         library = self._world.get_blueprint_library()
-        patterns = BLUEPRINT_CANDIDATES.get(
-            obj_type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN]
-        )
+        patterns = BLUEPRINT_CANDIDATES.get(obj_type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN])
         by_id = {}
         for pattern in patterns:
             try:
@@ -957,9 +955,7 @@ class CarlaAgentAV:
         if actor is not None:
             try:
                 extent = actor.bounding_box.extent
-                measured = tuple(
-                    float(value) * 2.0 for value in (extent.x, extent.y, extent.z)
-                )
+                measured = tuple(float(value) * 2.0 for value in (extent.x, extent.y, extent.z))
                 if all(math.isfinite(value) and value > 0 for value in measured):
                     dimensions = measured
             except Exception:
@@ -980,9 +976,7 @@ class CarlaAgentAV:
             )
         )
 
-    def _pick_blueprint_for_state(
-        self, state: ObjectStateData, *, preferred_id: str | None = None
-    ):
+    def _pick_blueprint_for_state(self, state: ObjectStateData, *, preferred_id: str | None = None):
         shape = state.shape
         library = self._world.get_blueprint_library()
         if shape is None:
