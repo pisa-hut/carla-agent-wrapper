@@ -489,6 +489,34 @@ def test_step_sets_destination_reached_quit_message(carla_agent_module) -> None:
     assert response.msg == "CARLA agent reached the destination."
 
 
+def test_step_ignores_agent_done_until_ego_is_within_goal_distance(
+    carla_agent_module,
+) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    adapter._agent = _DoneAgent()
+    adapter._goal_position_xy = (10.0, 0.0)
+    adapter._agent_done_distance = 1.0
+    adapter._quit_flag = False
+    adapter._quit_msg = ""
+
+    adapter.step(
+        SimpleNamespace(
+            observation=_observation(carla_agent_module, ego_x=7.0), timestamp_ns=0
+        )
+    )
+    assert adapter.should_quit().should_quit is False
+
+    adapter.step(
+        SimpleNamespace(
+            observation=ObservationData(
+                ego=_state(carla_agent_module, 9.5, time_ns=1)
+            ),
+            timestamp_ns=1,
+        )
+    )
+    assert adapter.should_quit().should_quit is True
+
+
 def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:
     adapter, _world = _make_tracking_adapter(carla_agent_module)
     adapter._vehicle = None
