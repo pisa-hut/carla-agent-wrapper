@@ -5,6 +5,7 @@ import os
 import random
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,27 +23,28 @@ from pisa_api.av import (
     InitRequest,
     InvalidAvRequest,
     ObjectStateData,
+    ObservationData,
     ResetRequest,
     ResetResponse,
     RoadObjectType,
     ScenarioPackData,
+    ShapeType,
     ShouldQuitResponse,
     StepRequest,
     StepResponse,
 )
 
 try:
+    from .geometry import finite, shapes_equivalent, validate_state
     from .lifecycle import clear_dynamic_actors, destroy_actor, force_async_world_for_cleanup
 except ImportError:
+    from geometry import finite, shapes_equivalent, validate_state
     from lifecycle import clear_dynamic_actors, destroy_actor, force_async_world_for_cleanup
 
 logger = logging.getLogger(__name__)
 
 VALID_BEHAVIORS = {"cautious", "normal", "aggressive"}
 VALID_AGENT_TYPES = {"behavior", "basic", "constant_velocity", "constant-velocity"}
-
-OBJECT_IDENTITY_ATTRS = ("id", "object_id", "track_id", "external_id", "name")
-OBJECT_IDENTITY_MODES = {"index", "provided", "stateless"}
 
 BLUEPRINT_CANDIDATES = {
     RoadObjectType.PEDESTRIAN: ("walker.pedestrian.0001", "walker.pedestrian.*", "walker.*"),
@@ -113,6 +115,14 @@ class CarlaAgentAV:
         self._other_actor_types: list[RoadObjectType] = []
         self._other_actors_by_key: dict[Any, Any] = {}
         self._other_actor_types_by_key: dict[Any, RoadObjectType] = {}
+        self._using_tracking_ids = False
+        self._last_timestamp_ns: int | None = None
+        self._ego_shape = None
+        self._shapes_by_tracking_id: dict[int, Any] = {}
+        self._goal_position_xy: tuple[float, float] | None = None
+        self._early_done_warned = False
+        self._blueprint_dimensions: dict[str, tuple[float, float, float] | None] = {}
+        self._geometry_warnings: set[tuple[Any, ...]] = set()
 
     def _connect(self, timeout: float = 2.0):
         if self._server_version is not None:
@@ -171,7 +181,11 @@ class CarlaAgentAV:
                 f"position={pos!r}"
             )
         try:
-            return float(source.x), float(source.y), float(source.z)
+            return (
+                finite(source.x, "position.x"),
+                finite(source.y, "position.y"),
+                finite(source.z, "position.z"),
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Failed to convert position coordinates to float: {pos!r}") from exc
 
@@ -180,20 +194,20 @@ class CarlaAgentAV:
             return 0.0
         if hasattr(pos, "yaw"):
             try:
-                return float(pos.yaw)
+                return finite(pos.yaw, "position.yaw")
             except (TypeError, ValueError) as exc:
                 raise InvalidAvRequest(f"Position yaw must be a float, got {pos.yaw!r}") from exc
         world = getattr(pos, "world", None)
         if world is not None and hasattr(world, "h"):
             try:
-                return float(world.h)
+                return finite(world.h, "position.world.h")
             except (TypeError, ValueError) as exc:
                 raise InvalidAvRequest(
                     f"Position heading must be a float, got {world.h!r}"
                 ) from exc
         if hasattr(pos, "h"):
             try:
-                return float(pos.h)
+                return finite(pos.h, "position.h")
             except (TypeError, ValueError) as exc:
                 raise InvalidAvRequest(f"Position heading must be a float, got {pos.h!r}") from exc
         return 0.0
@@ -211,20 +225,25 @@ class CarlaAgentAV:
         )
 
     def _get_target_speed_kmh(self, sps: ScenarioPackData) -> float:
-        speed = self._target_speed
-        if speed is None and sps is not None:
-            ego = getattr(sps, "ego", None)
-            if ego is not None and getattr(ego, "target_speed", None) is not None:
-                speed = ego.target_speed
-        if speed is None:
-            speed = 0.0
         try:
-            speed = float(speed)
-        except (TypeError, ValueError) as exc:
-            raise InvalidAvRequest(f"target_speed must be a float, got {speed!r}") from exc
-        if self._target_speed_is_mps:
-            speed = speed * 3.6
-        return speed
+            if self._target_speed_kmh is not None:
+                speed_kmh = finite(self._target_speed_kmh, "target_speed_kmh")
+                if speed_kmh < 0:
+                    raise InvalidAvRequest("target_speed_kmh must be non-negative")
+                return speed_kmh
+            speed_mps = self._target_speed
+            if speed_mps is None and sps is not None:
+                ego = getattr(sps, "ego", None)
+                if ego is not None and getattr(ego, "target_speed", None) is not None:
+                    speed_mps = ego.target_speed
+            if speed_mps is None:
+                speed_mps = 0.0
+            speed_mps = finite(speed_mps, "target_speed")
+            if speed_mps < 0:
+                raise InvalidAvRequest("target_speed must be non-negative")
+            return speed_mps * 3.6
+        except ValueError as exc:
+            raise InvalidAvRequest(str(exc)) from exc
 
     def _validate_config(self) -> None:
         if self._agent_type not in VALID_AGENT_TYPES:
@@ -244,7 +263,7 @@ class CarlaAgentAV:
     def _config_float(self, name: str, default: float) -> float:
         raw = self.config.get(name, default)
         try:
-            return float(raw)
+            return finite(raw, name)
         except (TypeError, ValueError) as exc:
             raise InvalidAvRequest(f"{name} must be a float, got {raw!r}") from exc
 
@@ -310,7 +329,12 @@ class CarlaAgentAV:
     def init(self, request: InitRequest) -> None:
         self._output_dir = request.output_dir
         self.config = request.config or {}
-        self._fixed_delta_seconds = request.dt
+        try:
+            self._fixed_delta_seconds = finite(request.dt, "Init.dt")
+        except ValueError as exc:
+            raise InvalidAvRequest(str(exc)) from exc
+        if self._fixed_delta_seconds <= 0:
+            raise InvalidAvRequest("Init.dt must be positive seconds")
 
         if not self._finalized:
             self._finalize()
@@ -330,17 +354,32 @@ class CarlaAgentAV:
         self._ignore_vehicles = bool(self.config.get("ignore_vehicles", False))
 
         self._target_speed = self.config.get("target_speed", None)
-        self._target_speed_is_mps = bool(self.config.get("target_speed_is_mps", False))
+        self._target_speed_kmh = self.config.get("target_speed_kmh", None)
+        if "target_speed_is_mps" in self.config:
+            raise InvalidAvRequest(
+                "target_speed_is_mps was removed; target_speed is always m/s, or use target_speed_kmh"
+            )
+        if self._target_speed is not None and self._target_speed_kmh is not None:
+            raise InvalidAvRequest("target_speed and target_speed_kmh are mutually exclusive")
         self._local_planner_base_min_distance = self._config_float(
-            "local_planner_base_min_distance", 3.0
+            "local_planner_base_min_distance", 1.0
         )
-        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.5)
+        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.0)
+        self._agent_done_distance = self._config_float("agent_done_distance", 1.0)
+        if self._agent_done_distance <= 0:
+            raise InvalidAvRequest("agent_done_distance must be positive")
         self._route_sampling_resolution = self._config_float("route_sampling_resolution", 3.0)
 
-        legacy_yaw_sign = self._config_sign("yaw_sign", -1.0)
-        self._coordinate_y_sign = self._config_sign("coordinate_y_sign", legacy_yaw_sign)
-        self._yaw_sign = self._config_sign("yaw_sign", legacy_yaw_sign)
-        self._steer_sign = self._config_sign("steer_sign", legacy_yaw_sign)
+        self._coordinate_y_sign = self._config_sign("coordinate_y_sign", -1.0)
+        self._yaw_sign = self._config_sign("yaw_sign", -1.0)
+        self._steer_sign = self._config_sign("steer_sign", -1.0)
+        for name, value in (
+            ("coordinate_y_sign", self._coordinate_y_sign),
+            ("yaw_sign", self._yaw_sign),
+            ("steer_sign", self._steer_sign),
+        ):
+            if value != -1.0:
+                raise InvalidAvRequest(f"{name} must be -1 for canonical-to-CARLA conversion")
         self._yaw_offset_deg = self._config_float("yaw_offset_deg", 0.0)
         self._spawn_z_offset = self._config_float("spawn_z_offset", 3.0)
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
@@ -349,21 +388,14 @@ class CarlaAgentAV:
         self._manage_traffic_manager_sync = bool(
             self.config.get("manage_traffic_manager_sync", False)
         )
-        self._object_identity_mode = str(
-            self.config.get("object_identity_mode", "stateless")
-        ).lower()
-        if self._object_identity_mode not in OBJECT_IDENTITY_MODES:
-            raise InvalidAvRequest(
-                f"Unsupported object_identity_mode: {self._object_identity_mode!r}. "
-                f"Expected one of: {', '.join(sorted(OBJECT_IDENTITY_MODES))}"
-            )
-
         if not self._ensure_connected():
             raise AvTimeout("Timed out connecting to CARLA")
 
         self._prepare_reused_server_state()
         self._quit_flag = False
         self._quit_msg = ""
+        self._rng_seed = int(self.config.get("random_seed", 0))
+        self._rng = random.Random(self._rng_seed)
         return None
 
     def reset(
@@ -381,12 +413,18 @@ class CarlaAgentAV:
         self._sps = sps
         self._quit_flag = False
         self._quit_msg = ""
+        self._reset_contract_state()
+        self._goal_position_xy = None
+        self._early_done_warned = False
 
         try:
             if sps is None:
                 raise InvalidAvRequest("ScenarioPack is required to prepare CARLA agent")
+            self._validate_timing(init_obs, 0)
+            init_obs = self._prepare_observation(init_obs)
             self._ensure_world(sps.map_name)
             self._clear_dynamic_actors()
+            self._reset_other_actor_state()
             self._vehicle = None
             logger.debug("Ego vehicle found: %s", self._vehicle)
             if self._vehicle is None:
@@ -405,7 +443,7 @@ class CarlaAgentAV:
                 spawn_points = self._map.get_spawn_points()
                 if not spawn_points:
                     raise InvalidAvRequest("No spawn points available for random destination")
-                dest = random.choice(spawn_points).location
+                dest = self._rng.choice(spawn_points).location
             else:
                 goal_pos = sps.ego.goal_config.position if sps is not None else None
                 if goal_pos is None:
@@ -417,12 +455,14 @@ class CarlaAgentAV:
                     spawn_points = self._map.get_spawn_points()
                     if not spawn_points:
                         raise InvalidAvRequest("No spawn points available for destination fallback")
-                    dest = random.choice(spawn_points).location
+                    dest = self._rng.choice(spawn_points).location
                 else:
                     try:
                         dest = self._to_carla_location(goal_pos)
                     except ValueError as exc:
                         raise InvalidAvRequest(str(exc)) from exc
+                    goal_x, goal_y, _goal_z = self._extract_xyz(goal_pos)
+                    self._goal_position_xy = (goal_x, goal_y)
             dest.z += self._spawn_z_offset  # to avoid underground issues
 
             start_transform = self._vehicle.get_transform()
@@ -452,9 +492,7 @@ class CarlaAgentAV:
                 ) from exc
 
             return ResetResponse(
-                ctrl_cmd=self.step(
-                    StepRequest(observation=init_obs if init_obs is not None else [])
-                ).ctrl_cmd
+                ctrl_cmd=self.step(StepRequest(observation=init_obs, timestamp_ns=0)).ctrl_cmd
             )
         except AvError:
             logger.exception("Failed to reset CARLA agent; finalizing partial state")
@@ -463,28 +501,124 @@ class CarlaAgentAV:
 
     def step(self, request: StepRequest) -> StepResponse:
         obs = request.observation
-        if not obs:
+        if obs is None or getattr(obs, "ego", None) is None:
             raise InvalidAvRequest("Step observation must include ego state")
+        try:
+            timestamp_ns = int(getattr(request, "timestamp_ns", 0))
+        except (TypeError, ValueError) as exc:
+            raise InvalidAvRequest("timestamp_ns must be an integer") from exc
+        self._validate_timing(obs, timestamp_ns)
+        obs = self._prepare_observation(obs)
         self._update_and_tick(obs)
         if self._agent is None:
             raise RuntimeError("CARLA agent is not initialized")
 
         control = self._agent.run_step()
-        if hasattr(self._agent, "done") and self._agent.done():
+        if (
+            hasattr(self._agent, "done")
+            and self._agent.done()
+            and self._ego_within_done_distance(obs)
+        ):
             self._quit_flag = True
             self._quit_msg = "CARLA agent reached the destination."
 
-        steer_sv = float(control.steer) / getattr(self, "_steer_sign", 1.0)
+        try:
+            throttle = finite(control.throttle, "control.throttle")
+            brake = finite(control.brake, "control.brake")
+            steer_sv = finite(control.steer, "control.steer") / self._steer_sign
+        except (AttributeError, ValueError) as exc:
+            raise AvPreconditionFailed(f"CARLA agent returned invalid control: {exc}") from exc
+        for name, value, lower, upper in (
+            ("throttle", throttle, 0.0, 1.0),
+            ("brake", brake, 0.0, 1.0),
+            ("steer", steer_sv, -1.0, 1.0),
+        ):
+            if not lower <= value <= upper:
+                raise AvPreconditionFailed(
+                    f"CARLA agent returned {name}={value}, expected [{lower}, {upper}]"
+                )
+        if brake > 0.0:
+            throttle = 0.0
+        self._last_timestamp_ns = timestamp_ns
         return StepResponse(
             ctrl_cmd=ControlCommand(
                 mode=ControlMode.THROTTLE_STEER_BREAK,
                 payload={
-                    "throttle": float(control.throttle),
-                    "brake": float(control.brake),
+                    "throttle": throttle,
+                    "brake": brake,
                     "steer": steer_sv,
                 },
             )
         )
+
+    def _ego_within_done_distance(self, observation: ObservationData) -> bool:
+        goal = getattr(self, "_goal_position_xy", None)
+        if goal is None:
+            return True
+        ego = observation.ego.kinematic
+        distance = math.hypot(float(ego.x) - goal[0], float(ego.y) - goal[1])
+        tolerance = float(getattr(self, "_agent_done_distance", 1.0))
+        if distance <= tolerance:
+            return True
+        if not getattr(self, "_early_done_warned", False):
+            self._early_done_warned = True
+            logger.warning(
+                "Ignoring early CARLA agent.done(): ego is %.3f m from goal "
+                "(agent_done_distance=%.3f m)",
+                distance,
+                tolerance,
+            )
+        return False
+
+    def _reset_contract_state(self) -> None:
+        self._last_timestamp_ns = None
+        self._ego_shape = None
+        self._shapes_by_tracking_id = {}
+        self._rng = random.Random(getattr(self, "_rng_seed", 0))
+
+    def _validate_timing(self, observation: ObservationData, timestamp_ns: int) -> None:
+        if timestamp_ns < 0:
+            raise InvalidAvRequest("timestamp_ns must be non-negative")
+        if self._last_timestamp_ns is None:
+            if timestamp_ns != 0:
+                raise InvalidAvRequest("the initial observation timestamp must be 0")
+        elif timestamp_ns <= self._last_timestamp_ns:
+            raise InvalidAvRequest("timestamp_ns must increase strictly within an episode")
+
+        states = [observation.ego, *(agent.state for agent in observation.agents)]
+        for state in states:
+            if int(state.kinematic.time_ns) != timestamp_ns:
+                raise InvalidAvRequest(
+                    "every ObjectKinematic.time_ns must equal StepRequest.timestamp_ns"
+                )
+
+    def _prepare_observation(self, observation: ObservationData) -> ObservationData:
+        try:
+            ego = self._state_with_cached_shape(observation.ego, self._ego_shape)
+            validate_state(ego, require_shape=self._ego_shape is None, shape_types=ShapeType)
+            if ego.shape is not None:
+                self._ego_shape = ego.shape
+
+            prepared_agents = []
+            all_tracked = all(agent.tracking_id is not None for agent in observation.agents)
+            for agent in observation.agents:
+                cached = self._shapes_by_tracking_id.get(agent.tracking_id) if all_tracked else None
+                state = self._state_with_cached_shape(agent.state, cached)
+                validate_state(state, require_shape=cached is None, shape_types=ShapeType)
+                if all_tracked and state.shape is not None:
+                    self._shapes_by_tracking_id[agent.tracking_id] = state.shape
+                prepared_agents.append(replace(agent, state=state))
+            return ObservationData(ego=ego, agents=prepared_agents)
+        except ValueError as exc:
+            raise InvalidAvRequest(str(exc)) from exc
+
+    @staticmethod
+    def _state_with_cached_shape(state: ObjectStateData, cached_shape):
+        if state.shape is None:
+            return replace(state, shape=cached_shape) if cached_shape is not None else state
+        if cached_shape is not None and not shapes_equivalent(state.shape, cached_shape):
+            raise ValueError("actor shape changed within an episode")
+        return state
 
     def stop(self) -> None:
         self._finalize()
@@ -561,12 +695,11 @@ class CarlaAgentAV:
             + (float(a.z) - float(b.z)) ** 2
         )
 
-    def _spawn_ego(self, init_obs: list[ObjectStateData] | None, sps: ScenarioPackData):
+    def _spawn_ego(self, init_obs: ObservationData, sps: ScenarioPackData):
         if self._world is None:
             raise AvUnavailable("CARLA world not available")
 
-        bp_lib = self._world.get_blueprint_library()
-        ego_bp = self._find_blueprint(bp_lib, (self._ego_bp_id, "vehicle.*"))
+        ego_bp = self._pick_blueprint_for_state(init_obs.ego, preferred_id=self._ego_bp_id)
         if ego_bp is None:
             raise InvalidAvRequest("No vehicle blueprints available in CARLA")
 
@@ -706,6 +839,8 @@ class CarlaAgentAV:
             world = self._client.get_world()
 
         self._world = world
+        getattr(self, "_blueprint_dimensions", {}).clear()
+        getattr(self, "_geometry_warnings", set()).clear()
         try:
             self._map = world.get_map()
         except Exception as exc:
@@ -726,6 +861,8 @@ class CarlaAgentAV:
         if self._world is not previous_world:
             self._loaded_map_name = None
             self._loaded_opendrive_path = None
+            getattr(self, "_blueprint_dimensions", {}).clear()
+            getattr(self, "_geometry_warnings", set()).clear()
         self._clear_dynamic_actors()
 
     def _clear_dynamic_actors(self) -> None:
@@ -739,14 +876,11 @@ class CarlaAgentAV:
 
     def _get_spawn_position(
         self,
-        init_obs: list[ObjectStateData] | None,
+        init_obs: ObservationData | None,
         sps: ScenarioPackData | None,
     ):
-        if init_obs:
-            try:
-                return init_obs[0].kinematic
-            except Exception:
-                pass
+        if init_obs is not None and getattr(init_obs, "ego", None) is not None:
+            return init_obs.ego.kinematic
         if sps is None:
             return None
         ego = getattr(sps, "ego", None)
@@ -795,31 +929,122 @@ class CarlaAgentAV:
         )
         return self._find_blueprint(self._world.get_blueprint_library(), candidates)
 
-    def _provided_object_identity(self, obj: ObjectStateData):
-        for attr in OBJECT_IDENTITY_ATTRS:
-            value = getattr(obj, attr, None)
-            if value not in (None, ""):
-                return attr, value
-        return None
+    def _candidate_blueprints(self, obj_type: RoadObjectType) -> list[Any]:
+        library = self._world.get_blueprint_library()
+        patterns = BLUEPRINT_CANDIDATES.get(obj_type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN])
+        by_id = {}
+        for pattern in patterns:
+            try:
+                matches = library.filter(pattern) if "*" in pattern else [library.find(pattern)]
+            except Exception:
+                continue
+            for blueprint in matches:
+                by_id[str(blueprint.id)] = blueprint
+        return [by_id[key] for key in sorted(by_id)]
 
-    def _object_identity(self, obj: ObjectStateData, index: int):
-        if self._object_identity_mode == "index":
-            return "index", index
-        if self._object_identity_mode == "stateless":
-            return "frame", index
+    def _measure_blueprint(self, blueprint) -> tuple[float, float, float] | None:
+        blueprint_id = str(blueprint.id)
+        if blueprint_id in self._blueprint_dimensions:
+            return self._blueprint_dimensions[blueprint_id]
+        probe_transform = self._carla.Transform(
+            self._carla.Location(x=0.0, y=0.0, z=10_000.0),
+            self._carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
+        )
+        actor = self._world.try_spawn_actor(blueprint, probe_transform)
+        dimensions = None
+        if actor is not None:
+            try:
+                extent = actor.bounding_box.extent
+                measured = tuple(float(value) * 2.0 for value in (extent.x, extent.y, extent.z))
+                if all(math.isfinite(value) and value > 0 for value in measured):
+                    dimensions = measured
+            except Exception:
+                logger.debug("Could not measure blueprint %s", blueprint_id, exc_info=True)
+            finally:
+                destroy_actor(actor, log=logger, label="geometry probe actor")
+        self._blueprint_dimensions[blueprint_id] = dimensions
+        return dimensions
 
-        identity = self._provided_object_identity(obj)
-        if identity is None:
-            raise InvalidAvRequest(
-                "object_identity_mode='provided' requires each non-ego object to expose one of: "
-                f"{', '.join(OBJECT_IDENTITY_ATTRS)}"
+    @staticmethod
+    def _dimension_score(
+        requested: tuple[float, float, float], candidate: tuple[float, float, float]
+    ) -> float:
+        return math.sqrt(
+            sum(
+                ((actual - target) / target) ** 2
+                for target, actual in zip(requested, candidate, strict=True)
             )
-        return identity
+        )
 
-    def _role_name_for_object_key(self, key) -> str:
-        raw = "_".join(str(part) for part in key)
-        safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in raw)
-        return f"agent_{safe}"[:255]
+    def _pick_blueprint_for_state(self, state: ObjectStateData, *, preferred_id: str | None = None):
+        shape = state.shape
+        library = self._world.get_blueprint_library()
+        if shape is None:
+            patterns = ((preferred_id,) if preferred_id else ()) + BLUEPRINT_CANDIDATES.get(
+                state.type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN]
+            )
+            return self._find_blueprint(library, patterns)
+
+        if shape.type != ShapeType.BOUNDING_BOX:
+            raise InvalidAvRequest(
+                f"unsupported shape type: {shape.type}; CARLA agents support BOUNDING_BOX"
+            )
+
+        requested = tuple(float(getattr(shape.dimensions, axis)) for axis in ("x", "y", "z"))
+        candidates = self._candidate_blueprints(state.type)
+        if preferred_id:
+            try:
+                preferred = library.find(preferred_id)
+            except Exception:
+                preferred = None
+            if preferred is not None and all(item.id != preferred.id for item in candidates):
+                candidates.append(preferred)
+
+        ranked = []
+        for blueprint in candidates:
+            dimensions = self._measure_blueprint(blueprint)
+            if dimensions is not None:
+                ranked.append(
+                    (
+                        self._dimension_score(requested, dimensions),
+                        str(blueprint.id),
+                        blueprint,
+                        dimensions,
+                    )
+                )
+        if not ranked:
+            fallback = self._pick_blueprint(state.type)
+            if fallback is None:
+                return None
+            warning_key = (state.type, requested, str(fallback.id), None)
+            if warning_key not in self._geometry_warnings:
+                self._geometry_warnings.add(warning_key)
+                logger.warning(
+                    "Unable to measure CARLA geometry; using blueprint=%s requested_dimensions=%s",
+                    fallback.id,
+                    requested,
+                )
+            return fallback
+
+        score, blueprint_id, blueprint, dimensions = min(
+            ranked, key=lambda item: (item[0], item[1])
+        )
+        warning_key = (state.type, requested, blueprint_id, dimensions)
+        if warning_key not in self._geometry_warnings:
+            self._geometry_warnings.add(warning_key)
+            logger.warning(
+                "PISA shape uses nearest CARLA geometry blueprint=%s requested_dimensions=%s "
+                "native_dimensions=%s relative_error=%.6f",
+                blueprint_id,
+                requested,
+                dimensions,
+                score,
+            )
+        return blueprint
+
+    @staticmethod
+    def _role_name_for_tracking_id(tracking_id: int) -> str:
+        return f"agent_{tracking_id}"[:255]
 
     def _spawn_actor_allowing_observation_overlap(self, blueprint, transform):
         if self._world is None:
@@ -860,32 +1085,127 @@ class CarlaAgentAV:
         with contextlib.suppress(Exception):
             actor.set_enable_gravity(False)
 
-    def _update_and_tick(self, obs: list[ObjectStateData]) -> None:
+    @staticmethod
+    def _rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float):
+        roll = math.radians(roll_deg)
+        pitch = math.radians(pitch_deg)
+        yaw = math.radians(yaw_deg)
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        return (
+            (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+            (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+            (-sp, cp * sr, cp * cr),
+        )
+
+    @staticmethod
+    def _matrix_multiply(left, right):
+        return tuple(
+            tuple(sum(left[row][k] * right[k][column] for k in range(3)) for column in range(3))
+            for row in range(3)
+        )
+
+    @staticmethod
+    def _matrix_vector(matrix, vector):
+        return tuple(sum(matrix[row][k] * vector[k] for k in range(3)) for row in range(3))
+
+    @staticmethod
+    def _matrix_transpose(matrix):
+        return tuple(tuple(matrix[column][row] for column in range(3)) for row in range(3))
+
+    @staticmethod
+    def _matrix_to_rotation(matrix):
+        pitch = math.asin(max(-1.0, min(1.0, -matrix[2][0])))
+        if abs(math.cos(pitch)) > 1e-8:
+            roll = math.atan2(matrix[2][1], matrix[2][2])
+            yaw = math.atan2(matrix[1][0], matrix[0][0])
+        else:
+            roll = 0.0
+            yaw = math.atan2(-matrix[0][1], matrix[1][1])
+        return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+    def _object_transform(self, state: ObjectStateData, actor=None, z_offset: float = 0.0):
+        kin = state.kinematic
+        kin_loc = self._to_carla_location(kin)
+        if z_offset:
+            kin_loc.z += z_offset
+        kin_yaw = self._to_carla_yaw(float(kin.yaw))
+        fallback = self._carla.Transform(
+            kin_loc,
+            self._carla.Rotation(pitch=0.0, yaw=kin_yaw, roll=0.0),
+        )
+
+        shape = getattr(state, "shape", None)
+        bounding_box = getattr(actor, "bounding_box", None)
+        if shape is None or shape.type != ShapeType.BOUNDING_BOX or bounding_box is None:
+            return fallback
+
+        center = shape.center
+        kin_rotation = self._rotation_matrix(0.0, 0.0, kin_yaw)
+        center_rotation = self._rotation_matrix(
+            math.degrees(float(center.roll)) * self._yaw_sign,
+            math.degrees(float(center.pitch)),
+            math.degrees(float(center.yaw)) * self._yaw_sign,
+        )
+        box_world_rotation = self._matrix_multiply(kin_rotation, center_rotation)
+        center_offset = (
+            float(center.x),
+            float(center.y) * self._coordinate_y_sign,
+            float(center.z),
+        )
+        rotated_center = self._matrix_vector(kin_rotation, center_offset)
+        box_world_location = (
+            float(kin_loc.x) + rotated_center[0],
+            float(kin_loc.y) + rotated_center[1],
+            float(kin_loc.z) + rotated_center[2],
+        )
+
+        local_location = getattr(bounding_box, "location", None)
+        local_rotation = getattr(bounding_box, "rotation", None)
+        actor_box_rotation = self._rotation_matrix(
+            float(getattr(local_rotation, "roll", 0.0)),
+            float(getattr(local_rotation, "pitch", 0.0)),
+            float(getattr(local_rotation, "yaw", 0.0)),
+        )
+        actor_rotation = self._matrix_multiply(
+            box_world_rotation, self._matrix_transpose(actor_box_rotation)
+        )
+        actor_box_offset = self._matrix_vector(
+            actor_rotation,
+            (
+                float(getattr(local_location, "x", 0.0)),
+                float(getattr(local_location, "y", 0.0)),
+                float(getattr(local_location, "z", 0.0)),
+            ),
+        )
+        actor_location = self._carla.Location(
+            box_world_location[0] - actor_box_offset[0],
+            box_world_location[1] - actor_box_offset[1],
+            box_world_location[2] - actor_box_offset[2],
+        )
+        roll, pitch, yaw = self._matrix_to_rotation(actor_rotation)
+        return self._carla.Transform(
+            actor_location,
+            self._carla.Rotation(pitch=pitch, yaw=yaw, roll=roll),
+        )
+
+    def _update_and_tick(self, observation: ObservationData) -> None:
         if self._world is None:
             return
 
-        def make_transform(kin, z_offset: float = 0.0):
-            loc = self._to_carla_location(kin)
-            if z_offset:
-                loc.z += z_offset
-            rot = self._carla.Rotation(
-                pitch=0.0,
-                yaw=self._to_carla_yaw(float(kin.yaw)),
-                roll=0.0,
-            )
-            return self._carla.Transform(loc, rot)
-
-        def apply_kinematic(actor, kin, *, make_kinematic: bool = False) -> None:
+        def apply_state(actor, state, *, make_kinematic: bool = False) -> None:
             if actor is None:
                 return
             if make_kinematic:
                 self._make_observation_actor_kinematic(actor)
             try:
-                transform = make_transform(kin)
+                transform = self._object_transform(state, actor)
             except ValueError as exc:
                 raise InvalidAvRequest(str(exc)) from exc
             actor.set_transform(transform)
 
+            kin = state.kinematic
             speed = float(kin.speed)
             yaw_carla_deg = self._to_carla_yaw(float(kin.yaw))
             yaw_carla_rad = math.radians(yaw_carla_deg)
@@ -907,13 +1227,6 @@ class CarlaAgentAV:
                     with contextlib.suppress(Exception):
                         actor.set_angular_velocity(ang)
 
-        if not obs:
-            if self._sync:
-                self._world.tick()
-            else:
-                self._world.wait_for_tick()
-            return
-
         if self._vehicle is None:
             # Auto-spawn is currently disabled (the `_spawn_ego` call
             # below is intentionally unreachable while the obs-based
@@ -924,58 +1237,81 @@ class CarlaAgentAV:
                 "Define the ego in the scenario pack or enable auto-spawn."
             )
 
-        ego_state = obs[0].kinematic
-        apply_kinematic(self._vehicle, ego_state)
+        apply_state(self._vehicle, observation.ego)
 
-        if getattr(self, "_object_identity_mode", "stateless") == "stateless":
+        agents = list(observation.agents)
+        tracking_ids = [agent.tracking_id for agent in agents]
+        use_tracking_ids = all(tracking_id is not None for tracking_id in tracking_ids)
+        if use_tracking_ids and len(set(tracking_ids)) != len(tracking_ids):
+            raise InvalidAvRequest("Observation contains duplicate agent tracking IDs")
+
+        if not use_tracking_ids:
             self._destroy_other_actors()
-
-        observed_keys = set()
-        for idx, obj in enumerate(obs[1:]):
-            key = self._object_identity(obj, idx)
-            observed_keys.add(key)
-            actor = self._other_actors_by_key.get(key)
-            obj_type = obj.type
-            if (
-                actor is None
-                or (hasattr(actor, "is_alive") and not actor.is_alive)
-                or self._other_actor_types_by_key.get(key) != obj_type
-            ):
-                if actor is not None:
-                    actor_id = getattr(actor, "id", None)
-                    if destroy_actor(actor, log=logger, label="actor"):
-                        self._spawned_actor_ids.discard(actor_id)
-                bp = self._pick_blueprint(obj_type)
+            self._using_tracking_ids = False
+            for observed_agent in agents:
+                obj = observed_agent.state
+                bp = self._pick_blueprint_for_state(obj)
                 if bp is None:
-                    raise InvalidAvRequest(f"No blueprint for object type {obj_type}")
+                    raise InvalidAvRequest(f"No blueprint for object type {obj.type}")
                 if bp.has_attribute("role_name"):
-                    bp.set_attribute("role_name", self._role_name_for_object_key(key))
+                    bp.set_attribute("role_name", "agent")
                 try:
-                    transform = make_transform(obj.kinematic, z_offset=self._spawn_z_offset)
+                    transform = self._object_transform(obj, z_offset=self._spawn_z_offset)
                 except ValueError as exc:
                     raise InvalidAvRequest(str(exc)) from exc
                 actor = self._spawn_actor_allowing_observation_overlap(bp, transform)
                 if actor is None:
-                    raise AvPreconditionFailed(f"Failed to spawn actor for object {key}")
+                    raise AvPreconditionFailed("Failed to spawn stateless observation actor")
                 self._spawned_actor_ids.add(actor.id)
-                self._other_actors_by_key[key] = actor
-                self._other_actor_types_by_key[key] = obj_type
+                self._other_actors.append(actor)
+                self._other_actor_types.append(obj.type)
+                apply_state(actor, obj, make_kinematic=True)
+        else:
+            if not getattr(self, "_using_tracking_ids", False):
+                self._destroy_other_actors()
+            self._using_tracking_ids = True
+            observed_keys = set(tracking_ids)
+            for observed_agent in agents:
+                key = observed_agent.tracking_id
+                obj = observed_agent.state
+                actor = self._other_actors_by_key.get(key)
+                obj_type = obj.type
+                if (
+                    actor is None
+                    or (hasattr(actor, "is_alive") and not actor.is_alive)
+                    or self._other_actor_types_by_key.get(key) != obj_type
+                ):
+                    if actor is not None:
+                        actor_id = getattr(actor, "id", None)
+                        if destroy_actor(actor, log=logger, label="actor"):
+                            self._spawned_actor_ids.discard(actor_id)
+                    bp = self._pick_blueprint_for_state(obj)
+                    if bp is None:
+                        raise InvalidAvRequest(f"No blueprint for object type {obj_type}")
+                    if bp.has_attribute("role_name"):
+                        bp.set_attribute("role_name", self._role_name_for_tracking_id(key))
+                    try:
+                        transform = self._object_transform(obj, z_offset=self._spawn_z_offset)
+                    except ValueError as exc:
+                        raise InvalidAvRequest(str(exc)) from exc
+                    actor = self._spawn_actor_allowing_observation_overlap(bp, transform)
+                    if actor is None:
+                        raise AvPreconditionFailed(f"Failed to spawn actor for tracking ID {key}")
+                    self._spawned_actor_ids.add(actor.id)
+                    self._other_actors_by_key[key] = actor
+                    self._other_actor_types_by_key[key] = obj_type
 
-            apply_kinematic(
-                self._other_actors_by_key.get(key),
-                obj.kinematic,
-                make_kinematic=True,
-            )
+                apply_state(self._other_actors_by_key.get(key), obj, make_kinematic=True)
 
-        for key in set(self._other_actors_by_key) - observed_keys:
-            actor = self._other_actors_by_key.pop(key)
-            self._other_actor_types_by_key.pop(key, None)
-            actor_id = getattr(actor, "id", None)
-            if destroy_actor(actor, log=logger, label="stale actor"):
-                self._spawned_actor_ids.discard(actor_id)
+            for key in set(self._other_actors_by_key) - observed_keys:
+                actor = self._other_actors_by_key.pop(key)
+                self._other_actor_types_by_key.pop(key, None)
+                actor_id = getattr(actor, "id", None)
+                if destroy_actor(actor, log=logger, label="stale actor"):
+                    self._spawned_actor_ids.discard(actor_id)
 
-        self._other_actors = list(self._other_actors_by_key.values())
-        self._other_actor_types = list(self._other_actor_types_by_key.values())
+            self._other_actors = list(self._other_actors_by_key.values())
+            self._other_actor_types = list(self._other_actor_types_by_key.values())
 
         if self._sync:
             self._world.tick()
@@ -994,6 +1330,15 @@ class CarlaAgentAV:
         self._other_actor_types.clear()
         other_actors_by_key.clear()
         other_actor_types_by_key.clear()
+        self._using_tracking_ids = False
+
+    def _reset_other_actor_state(self) -> None:
+        self._other_actors.clear()
+        self._other_actor_types.clear()
+        self._other_actors_by_key.clear()
+        self._other_actor_types_by_key.clear()
+        self._spawned_actor_ids.clear()
+        self._using_tracking_ids = False
 
     def _destroy_spawned_actors(self) -> None:
         if self._world is None:
@@ -1002,6 +1347,7 @@ class CarlaAgentAV:
             self._other_actors_by_key.clear()
             self._other_actor_types_by_key.clear()
             self._spawned_actor_ids.clear()
+            self._using_tracking_ids = False
             return
 
         force_async_world_for_cleanup(
@@ -1042,3 +1388,4 @@ class CarlaAgentAV:
         other_actors_by_key.clear()
         other_actor_types_by_key.clear()
         self._spawned_actor_ids.clear()
+        self._using_tracking_ids = False
