@@ -119,8 +119,6 @@ class CarlaAgentAV:
         self._last_timestamp_ns: int | None = None
         self._ego_shape = None
         self._shapes_by_tracking_id: dict[int, Any] = {}
-        self._goal_position_xy: tuple[float, float] | None = None
-        self._early_done_warned = False
         self._blueprint_dimensions: dict[str, tuple[float, float, float] | None] = {}
         self._geometry_warnings: set[tuple[Any, ...]] = set()
 
@@ -139,6 +137,31 @@ class CarlaAgentAV:
             self._client.set_timeout(float(os.environ.get("CARLA_TIMEOUT", 10.0)))
         logger.debug("Connected to CARLA")
 
+    def _carla_endpoint(self) -> str:
+        host = os.environ.get("CARLA_HOST", "localhost")
+        port = int(os.environ.get("CARLA_PORT", 2000))
+        return f"{host}:{port}"
+
+    def _server_process_returncode(self) -> int | None:
+        process = getattr(self, "_server_process", None)
+        return None if process is None else process.poll()
+
+    def _server_log_hint(self) -> str:
+        log_path = getattr(self, "_server_log_path", "/mnt/output/carla_server")
+        return f"See {log_path}/stdout.log and {log_path}/stderr.log."
+
+    def _raise_if_server_exited(self, *, cause: Exception | None = None) -> None:
+        returncode = self._server_process_returncode()
+        if returncode is None:
+            return
+        message = (
+            f"CARLA server process exited with code {returncode} before responding at "
+            f"{self._carla_endpoint()}. {self._server_log_hint()}"
+        )
+        if cause is None:
+            raise AvUnavailable(message)
+        raise AvUnavailable(message) from cause
+
     def _ensure_connected(self) -> bool:
         config = getattr(self, "config", {}) or {}
         if "carla_connect_timeout_seconds" in config:
@@ -151,21 +174,39 @@ class CarlaAgentAV:
         if retry_interval <= 0:
             raise InvalidAvRequest("retry_interval_seconds must be positive")
         end_time = time.time() + timeout
+        last_error: Exception | None = None
 
         while self._server_version is None:
+            self._raise_if_server_exited(cause=last_error)
             try:
                 self._connect(2.0)
                 return True
-            except Exception:
+            except AvError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self._raise_if_server_exited(cause=exc)
                 remaining = end_time - time.time()
                 if remaining <= 0:
-                    logger.exception("Failed to connect to CARLA: connection timeout.")
-                    return False
+                    process = getattr(self, "_server_process", None)
+                    process_status = (
+                        "the CARLA server process is still running but its RPC endpoint did not "
+                        "respond"
+                        if process is not None
+                        else "the CARLA server process status is unavailable and its RPC endpoint "
+                        "did not respond"
+                    )
+                    raise AvTimeout(
+                        f"Timed out after {timeout:g} seconds connecting to CARLA at "
+                        f"{self._carla_endpoint()}; {process_status}. "
+                        f"Last connection error: {type(exc).__name__}: {exc}. "
+                        f"{self._server_log_hint()}"
+                    ) from exc
                 logger.exception(
                     "Failed to connect to CARLA, retrying in %.1f seconds...",
                     retry_interval,
                 )
-                time.sleep(retry_interval)
+                time.sleep(min(retry_interval, remaining))
 
         return True
 
@@ -365,9 +406,6 @@ class CarlaAgentAV:
             "local_planner_base_min_distance", 1.0
         )
         self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.0)
-        self._agent_done_distance = self._config_float("agent_done_distance", 1.0)
-        if self._agent_done_distance <= 0:
-            raise InvalidAvRequest("agent_done_distance must be positive")
         self._route_sampling_resolution = self._config_float("route_sampling_resolution", 3.0)
 
         self._coordinate_y_sign = self._config_sign("coordinate_y_sign", -1.0)
@@ -388,8 +426,7 @@ class CarlaAgentAV:
         self._manage_traffic_manager_sync = bool(
             self.config.get("manage_traffic_manager_sync", False)
         )
-        if not self._ensure_connected():
-            raise AvTimeout("Timed out connecting to CARLA")
+        self._ensure_connected()
 
         self._prepare_reused_server_state()
         self._quit_flag = False
@@ -414,8 +451,6 @@ class CarlaAgentAV:
         self._quit_flag = False
         self._quit_msg = ""
         self._reset_contract_state()
-        self._goal_position_xy = None
-        self._early_done_warned = False
 
         try:
             if sps is None:
@@ -461,8 +496,6 @@ class CarlaAgentAV:
                         dest = self._to_carla_location(goal_pos)
                     except ValueError as exc:
                         raise InvalidAvRequest(str(exc)) from exc
-                    goal_x, goal_y, _goal_z = self._extract_xyz(goal_pos)
-                    self._goal_position_xy = (goal_x, goal_y)
             dest.z += self._spawn_z_offset  # to avoid underground issues
 
             start_transform = self._vehicle.get_transform()
@@ -514,11 +547,7 @@ class CarlaAgentAV:
             raise RuntimeError("CARLA agent is not initialized")
 
         control = self._agent.run_step()
-        if (
-            hasattr(self._agent, "done")
-            and self._agent.done()
-            and self._ego_within_done_distance(obs)
-        ):
+        if hasattr(self._agent, "done") and self._agent.done():
             self._quit_flag = True
             self._quit_msg = "CARLA agent reached the destination."
 
@@ -550,25 +579,6 @@ class CarlaAgentAV:
                 },
             )
         )
-
-    def _ego_within_done_distance(self, observation: ObservationData) -> bool:
-        goal = getattr(self, "_goal_position_xy", None)
-        if goal is None:
-            return True
-        ego = observation.ego.kinematic
-        distance = math.hypot(float(ego.x) - goal[0], float(ego.y) - goal[1])
-        tolerance = float(getattr(self, "_agent_done_distance", 1.0))
-        if distance <= tolerance:
-            return True
-        if not getattr(self, "_early_done_warned", False):
-            self._early_done_warned = True
-            logger.warning(
-                "Ignoring early CARLA agent.done(): ego is %.3f m from goal "
-                "(agent_done_distance=%.3f m)",
-                distance,
-                tolerance,
-            )
-        return False
 
     def _reset_contract_state(self) -> None:
         self._last_timestamp_ns = None
@@ -770,8 +780,8 @@ class CarlaAgentAV:
     def _ensure_world(self, map_name: str) -> None:
         if not map_name:
             raise InvalidAvRequest("ScenarioPack map_name is required to generate CARLA world")
-        if self._server_version is None and not self._ensure_connected():
-            raise AvTimeout("Timed out connecting to CARLA before loading world")
+        if self._server_version is None:
+            self._ensure_connected()
         if self._client is None:
             raise AvUnavailable("CARLA client is not available")
 

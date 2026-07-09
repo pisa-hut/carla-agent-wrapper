@@ -394,6 +394,56 @@ def test_init_requires_positive_finite_dt(carla_agent_module) -> None:
         adapter.init(SimpleNamespace(output_dir="out", config={}, dt=0.0))
 
 
+class _FakeServerProcess:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
+def _make_disconnected_adapter(carla_agent_module, *, process_returncode):
+    adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
+    adapter.config = {
+        "carla_connect_timeout_seconds": 0.001,
+        "retry_interval_seconds": 0.001,
+    }
+    adapter._server_version = None
+    adapter._server_process = _FakeServerProcess(process_returncode)
+    adapter._server_log_path = "/tmp/carla_server"
+    return adapter
+
+
+def test_connect_reports_server_process_exit(carla_agent_module) -> None:
+    adapter = _make_disconnected_adapter(carla_agent_module, process_returncode=17)
+    adapter._connect = lambda timeout: pytest.fail("connection should not be attempted")
+
+    with pytest.raises(carla_agent_module.AvUnavailable) as exc_info:
+        adapter._ensure_connected()
+
+    message = str(exc_info.value)
+    assert "server process exited with code 17" in message
+    assert "localhost:2000" in message
+    assert "/tmp/carla_server/stderr.log" in message
+
+
+def test_connect_reports_running_but_unresponsive_server(carla_agent_module) -> None:
+    adapter = _make_disconnected_adapter(carla_agent_module, process_returncode=None)
+
+    def fail_connect(timeout):
+        raise RuntimeError("RPC request timed out")
+
+    adapter._connect = fail_connect
+
+    with pytest.raises(carla_agent_module.AvTimeout) as exc_info:
+        adapter._ensure_connected()
+
+    message = str(exc_info.value)
+    assert "server process is still running" in message
+    assert "RPC endpoint did not respond" in message
+    assert "RuntimeError: RPC request timed out" in message
+
+
 def test_build_agent_configures_local_planner_completion_distance(carla_agent_module) -> None:
     adapter = carla_agent_module.CarlaAgentAV.__new__(carla_agent_module.CarlaAgentAV)
     adapter._vehicle = object()
@@ -487,30 +537,6 @@ def test_step_sets_destination_reached_quit_message(carla_agent_module) -> None:
 
     assert response.should_quit is True
     assert response.msg == "CARLA agent reached the destination."
-
-
-def test_step_ignores_agent_done_until_ego_is_within_goal_distance(
-    carla_agent_module,
-) -> None:
-    adapter, _world = _make_tracking_adapter(carla_agent_module)
-    adapter._agent = _DoneAgent()
-    adapter._goal_position_xy = (10.0, 0.0)
-    adapter._agent_done_distance = 1.0
-    adapter._quit_flag = False
-    adapter._quit_msg = ""
-
-    adapter.step(
-        SimpleNamespace(observation=_observation(carla_agent_module, ego_x=7.0), timestamp_ns=0)
-    )
-    assert adapter.should_quit().should_quit is False
-
-    adapter.step(
-        SimpleNamespace(
-            observation=ObservationData(ego=_state(carla_agent_module, 9.5, time_ns=1)),
-            timestamp_ns=1,
-        )
-    )
-    assert adapter.should_quit().should_quit is True
 
 
 def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:

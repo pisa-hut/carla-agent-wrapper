@@ -107,10 +107,6 @@ route_sampling_resolution: 3.0
 local_planner_base_min_distance: 1.0
 local_planner_distance_ratio: 0.0
 
-# The wrapper also ignores an early native agent.done() until the observed ego
-# is within this horizontal distance of the scenario goal.
-agent_done_distance: 1.0
-
 # ---------------------------------------------------------------------------
 # Coordinate / control conversion
 # ---------------------------------------------------------------------------
