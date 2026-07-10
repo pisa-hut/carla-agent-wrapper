@@ -119,6 +119,9 @@ class CarlaAgentAV:
         self._last_timestamp_ns: int | None = None
         self._ego_shape = None
         self._shapes_by_tracking_id: dict[int, Any] = {}
+        self._goal_position_xy: tuple[float, float] | None = None
+        self._early_done_warned = False
+        self._native_agent_done = False
         self._blueprint_dimensions: dict[str, tuple[float, float, float] | None] = {}
         self._geometry_warnings: set[tuple[Any, ...]] = set()
 
@@ -403,9 +406,12 @@ class CarlaAgentAV:
         if self._target_speed is not None and self._target_speed_kmh is not None:
             raise InvalidAvRequest("target_speed and target_speed_kmh are mutually exclusive")
         self._local_planner_base_min_distance = self._config_float(
-            "local_planner_base_min_distance", 1.0
+            "local_planner_base_min_distance", 3.0
         )
-        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.0)
+        self._local_planner_distance_ratio = self._config_float("local_planner_distance_ratio", 0.5)
+        self._agent_done_distance = self._config_float("agent_done_distance", 1.0)
+        if self._agent_done_distance <= 0:
+            raise InvalidAvRequest("agent_done_distance must be positive")
         self._route_sampling_resolution = self._config_float("route_sampling_resolution", 3.0)
 
         self._coordinate_y_sign = self._config_sign("coordinate_y_sign", -1.0)
@@ -451,6 +457,9 @@ class CarlaAgentAV:
         self._quit_flag = False
         self._quit_msg = ""
         self._reset_contract_state()
+        self._goal_position_xy = None
+        self._early_done_warned = False
+        self._native_agent_done = False
 
         try:
             if sps is None:
@@ -496,6 +505,8 @@ class CarlaAgentAV:
                         dest = self._to_carla_location(goal_pos)
                     except ValueError as exc:
                         raise InvalidAvRequest(str(exc)) from exc
+                    goal_x, goal_y, _goal_z = self._extract_xyz(goal_pos)
+                    self._goal_position_xy = (goal_x, goal_y)
             dest.z += self._spawn_z_offset  # to avoid underground issues
 
             start_transform = self._vehicle.get_transform()
@@ -546,10 +557,15 @@ class CarlaAgentAV:
         if self._agent is None:
             raise RuntimeError("CARLA agent is not initialized")
 
+        if self._native_agent_done:
+            self._mark_destination_reached_if_allowed(obs)
+            self._last_timestamp_ns = timestamp_ns
+            return self._safe_stop_response()
+
         control = self._agent.run_step()
         if hasattr(self._agent, "done") and self._agent.done():
-            self._quit_flag = True
-            self._quit_msg = "CARLA agent reached the destination."
+            self._native_agent_done = True
+            self._mark_destination_reached_if_allowed(obs)
 
         try:
             throttle = finite(control.throttle, "control.throttle")
@@ -576,6 +592,46 @@ class CarlaAgentAV:
                     "throttle": throttle,
                     "brake": brake,
                     "steer": steer_sv,
+                },
+            )
+        )
+
+    def _mark_destination_reached_if_allowed(self, observation: ObservationData) -> bool:
+        goal = getattr(self, "_goal_position_xy", None)
+        if goal is None:
+            self._quit_flag = True
+            self._quit_msg = "CARLA agent reached the destination."
+            return True
+
+        ego = observation.ego.kinematic
+        distance = math.hypot(float(ego.x) - goal[0], float(ego.y) - goal[1])
+        tolerance = float(getattr(self, "_agent_done_distance", 1.0))
+        if distance <= tolerance:
+            self._quit_flag = True
+            self._quit_msg = "CARLA agent reached the destination."
+            return True
+
+        if not getattr(self, "_early_done_warned", False):
+            self._early_done_warned = True
+            logger.warning(
+                "CARLA native agent.done() occurred while ego is %.3f m from the PISA goal "
+                "(agent_done_distance=%.3f m). The wrapper will stop calling agent.run_step() "
+                "to avoid using a completed LocalPlanner route and will not report done until "
+                "the observed ego reaches the PISA goal tolerance.",
+                distance,
+                tolerance,
+            )
+        return False
+
+    @staticmethod
+    def _safe_stop_response() -> StepResponse:
+        return StepResponse(
+            ctrl_cmd=ControlCommand(
+                mode=ControlMode.THROTTLE_STEER_BREAK,
+                payload={
+                    "throttle": 0.0,
+                    "brake": 1.0,
+                    "steer": 0.0,
                 },
             )
         )

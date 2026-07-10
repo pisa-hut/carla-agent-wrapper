@@ -235,6 +235,21 @@ class _DoneAgent(_FakeAgent):
         return True
 
 
+class _DoneAgentRaisesOnSecondRun(_FakeAgent):
+    def __init__(self):
+        super().__init__()
+        self.run_count = 0
+
+    def run_step(self):
+        self.run_count += 1
+        if self.run_count > 1:
+            raise RuntimeError("run_step must not be called after native done")
+        return SimpleNamespace(throttle=0.0, brake=0.0, steer=0.0)
+
+    def done(self):
+        return True
+
+
 @pytest.fixture
 def carla_agent_module(monkeypatch):
     fake_carla = ModuleType("carla")
@@ -539,6 +554,51 @@ def test_step_sets_destination_reached_quit_message(carla_agent_module) -> None:
     assert response.msg == "CARLA agent reached the destination."
 
 
+def test_native_done_latches_and_stops_calling_run_step_until_pisa_goal(
+    carla_agent_module,
+) -> None:
+    adapter, _world = _make_tracking_adapter(carla_agent_module)
+    agent = _DoneAgentRaisesOnSecondRun()
+    adapter._agent = agent
+    adapter._goal_position_xy = (10.0, 0.0)
+    adapter._agent_done_distance = 1.0
+
+    first = adapter.step(
+        SimpleNamespace(
+            observation=carla_agent_module.ObservationData(
+                ego=_state(carla_agent_module, 7.0, time_ns=0)
+            ),
+            timestamp_ns=0,
+        )
+    )
+    assert first.ctrl_cmd.payload["brake"] == 0.0
+    assert adapter.should_quit().should_quit is False
+    assert agent.run_count == 1
+
+    second = adapter.step(
+        SimpleNamespace(
+            observation=carla_agent_module.ObservationData(
+                ego=_state(carla_agent_module, 7.5, time_ns=1)
+            ),
+            timestamp_ns=1,
+        )
+    )
+    assert second.ctrl_cmd.payload == {"throttle": 0.0, "brake": 1.0, "steer": 0.0}
+    assert adapter.should_quit().should_quit is False
+    assert agent.run_count == 1
+
+    adapter.step(
+        SimpleNamespace(
+            observation=carla_agent_module.ObservationData(
+                ego=_state(carla_agent_module, 9.5, time_ns=2)
+            ),
+            timestamp_ns=2,
+        )
+    )
+    assert adapter.should_quit().should_quit is True
+    assert agent.run_count == 1
+
+
 def test_step_does_not_wrap_broken_private_state(carla_agent_module) -> None:
     adapter, _world = _make_tracking_adapter(carla_agent_module)
     adapter._vehicle = None
@@ -647,6 +707,8 @@ def _make_tracking_adapter(carla_agent_module):
     )
     adapter._vehicle = _FakeMovingActor(actor_id=1)
     adapter._sync = True
+    adapter._quit_flag = False
+    adapter._quit_msg = ""
     adapter._spawn_z_offset = 0.0
     adapter._coordinate_y_sign = 1.0
     adapter._yaw_sign = 1.0
@@ -661,6 +723,10 @@ def _make_tracking_adapter(carla_agent_module):
     adapter._last_timestamp_ns = None
     adapter._ego_shape = None
     adapter._shapes_by_tracking_id = {}
+    adapter._goal_position_xy = None
+    adapter._agent_done_distance = 1.0
+    adapter._early_done_warned = False
+    adapter._native_agent_done = False
     adapter._blueprint_dimensions = {}
     adapter._geometry_warnings = set()
     adapter._rng_seed = 0

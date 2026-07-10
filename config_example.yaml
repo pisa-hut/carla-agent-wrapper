@@ -102,10 +102,16 @@ random_seed: 0
 route_sampling_resolution: 3.0
 
 # CARLA LocalPlanner removes passed waypoints when the ego is within:
-# base_min_distance + distance_ratio * speed_mps. This must remain below the
-# framework goal tolerance (normally 2 m), or agent.done() can occur too early.
-local_planner_base_min_distance: 1.0
-local_planner_distance_ratio: 0.0
+# base_min_distance + distance_ratio * speed_mps. These are CARLA's native
+# defaults; lowering them too much can destabilize waypoint tracking.
+local_planner_base_min_distance: 3.0
+local_planner_distance_ratio: 0.5
+
+# The wrapper does not equate native agent.done() with scenario completion.
+# After CARLA's LocalPlanner route is done, the wrapper stops calling
+# agent.run_step() and only reports done once the observed ego is within this
+# horizontal distance of the original PISA goal.
+agent_done_distance: 1.0
 
 # ---------------------------------------------------------------------------
 # Coordinate / control conversion
