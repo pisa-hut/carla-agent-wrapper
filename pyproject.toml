@@ -1,6 +1,6 @@
 [project]
 name = "carla-agent-wrapper"
-version = "0.2.0"
+version = "0.2.1"
 description = "A carla agent wrapper for SBSVF"
 readme = "README.md"
 requires-python = "==3.10.*"
@@ -14,11 +14,12 @@ dependencies = [
     "opencv-python==4.7.0.72",
     "psutil>=7.2.2",
     "py-trees==0.8.3",
-    "pisa-api>=0.4.0",
+    "pisa-api>=0.4.1",
     "shapely==2.1.1",
     "simple-watchdog-timer>=0.1.1",
     "six>=1.17.0",
     "tabulate>=0.9.0",
+    "tomli>=2.0",
     "xmlschema==1.0.18",
 ]
 
@@ -26,7 +27,7 @@ dependencies = [
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.uv.sources]
-pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git", rev = "709d811" }
+pisa-api = { git = "https://github.com/pisa-hut/pisa-api.git" }
 
 [tool.ruff]
 line-length = 100
@@ -39,3 +40,6 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["carla_agent_wrapper"]
