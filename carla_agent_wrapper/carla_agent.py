@@ -21,6 +21,7 @@ from pisa_api.av import (
     ControlCommand,
     ControlMode,
     InitRequest,
+    InitResponse,
     InvalidAvRequest,
     ObjectStateData,
     ObservationData,
@@ -370,7 +371,7 @@ class CarlaAgentAV:
         local_planner._distance_ratio = self._local_planner_distance_ratio
         local_planner._min_distance = self._local_planner_base_min_distance
 
-    def init(self, request: InitRequest) -> None:
+    def init(self, request: InitRequest) -> InitResponse:
         self._output_dir = request.output_dir
         self.config = request.config or {}
         try:
@@ -386,8 +387,8 @@ class CarlaAgentAV:
         self._sync = bool(self.config.get("sync", True))
         self._no_rendering = bool(self.config.get("no_rendering", True))
 
-        self._ego_role_name = self.config.get("ego_role_name", "hero")
-        self._ego_bp_id = self.config.get("ego_bp_id", "vehicle.tesla.model3")
+        self._ego_role_name = str(self.config.get("ego_role_name", "hero"))
+        self._ego_bp_id = str(self.config.get("ego_bp_id", "vehicle.tesla.model3"))
         self._agent_type = str(self.config.get("agent_type", "behavior")).lower()
         self._behavior = str(self.config.get("behavior", "normal")).lower()
         self._validate_config()
@@ -439,7 +440,49 @@ class CarlaAgentAV:
         self._quit_msg = ""
         self._rng_seed = int(self.config.get("random_seed", 0))
         self._rng = random.Random(self._rng_seed)
-        return None
+        canonical_agent_type = self._agent_type.replace("-", "_")
+        component_name = f"{canonical_agent_type.replace('_', '-')}-agent"
+        effective_config = {
+            "agent_type": canonical_agent_type,
+            "ego_role_name": str(self._ego_role_name),
+            "ego_bp_id": str(self._ego_bp_id),
+            "sync": self._sync,
+            "no_rendering": self._no_rendering,
+            "random_destination": self._random_destination,
+            "follow_speed_limits": self._follow_speed_limits,
+            "ignore_traffic_lights": self._ignore_traffic_lights,
+            "ignore_stop_signs": self._ignore_stop_signs,
+            "ignore_vehicles": self._ignore_vehicles,
+            "local_planner_base_min_distance": self._local_planner_base_min_distance,
+            "local_planner_distance_ratio": self._local_planner_distance_ratio,
+            "agent_done_distance": self._agent_done_distance,
+            "route_sampling_resolution": self._route_sampling_resolution,
+            "coordinate_y_sign": self._coordinate_y_sign,
+            "yaw_sign": self._yaw_sign,
+            "steer_sign": self._steer_sign,
+            "yaw_offset_deg": self._yaw_offset_deg,
+            "spawn_z_offset": self._spawn_z_offset,
+            "reuse_generated_world": self._reuse_generated_world,
+            "manage_traffic_manager_sync": self._manage_traffic_manager_sync,
+            "random_seed": self._rng_seed,
+        }
+        if canonical_agent_type == "behavior":
+            effective_config["behavior"] = self._behavior
+        if self._target_speed is not None:
+            target_speed = finite(self._target_speed, "target_speed")
+            if target_speed < 0:
+                raise InvalidAvRequest("target_speed must be non-negative")
+            effective_config["target_speed"] = target_speed
+        if self._target_speed_kmh is not None:
+            target_speed_kmh = finite(self._target_speed_kmh, "target_speed_kmh")
+            if target_speed_kmh < 0:
+                raise InvalidAvRequest("target_speed_kmh must be non-negative")
+            effective_config["target_speed_kmh"] = target_speed_kmh
+
+        return InitResponse(
+            name=component_name,
+            metadata={"effective_config": effective_config},
+        )
 
     def reset(
         self,
