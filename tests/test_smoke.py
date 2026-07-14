@@ -908,7 +908,7 @@ def test_spawn_retries_above_observation_when_initial_spawn_collides(
     assert actor.transforms[-1].location.z == 0.0
 
 
-def test_only_non_ego_observation_actors_are_kinematic_before_tick(
+def test_all_shadow_actors_get_experimental_physics_before_tick(
     carla_agent_module,
 ) -> None:
     adapter, world = _make_tracking_adapter(carla_agent_module)
@@ -918,10 +918,10 @@ def test_only_non_ego_observation_actors_are_kinematic_before_tick(
     adapter._update_and_tick(_observation(carla_agent_module, [obj]))
 
     other_actor = adapter._other_actors_by_key[1]
-    assert ego_actor.simulate_physics_calls == []
-    assert ego_actor.enable_gravity_calls == []
-    assert other_actor.simulate_physics_calls[-1] is False
-    assert other_actor.enable_gravity_calls[-1] is False
+    assert ego_actor.simulate_physics_calls[-1] is True
+    assert ego_actor.enable_gravity_calls[-1] is True
+    assert other_actor.simulate_physics_calls[-1] is True
+    assert other_actor.enable_gravity_calls[-1] is True
     assert world.tick_calls == 1
 
 

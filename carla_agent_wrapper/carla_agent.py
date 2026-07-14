@@ -1186,13 +1186,13 @@ class CarlaAgentAV:
                 return actor
         return None
 
-    def _make_observation_actor_kinematic(self, actor) -> None:
+    def _configure_shadow_actor_physics(self, actor) -> None:
         if actor is None:
             return
         with contextlib.suppress(Exception):
-            actor.set_simulate_physics(False)
+            actor.set_simulate_physics(True)
         with contextlib.suppress(Exception):
-            actor.set_enable_gravity(False)
+            actor.set_enable_gravity(True)
 
     @staticmethod
     def _rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float):
@@ -1303,11 +1303,11 @@ class CarlaAgentAV:
         if self._world is None:
             return
 
-        def apply_state(actor, state, *, make_kinematic: bool = False) -> None:
+        def apply_state(actor, state, *, configure_shadow_physics: bool = False) -> None:
             if actor is None:
                 return
-            if make_kinematic:
-                self._make_observation_actor_kinematic(actor)
+            if configure_shadow_physics:
+                self._configure_shadow_actor_physics(actor)
             try:
                 transform = self._object_transform(state, actor)
             except ValueError as exc:
@@ -1346,7 +1346,7 @@ class CarlaAgentAV:
                 "Define the ego in the scenario pack or enable auto-spawn."
             )
 
-        apply_state(self._vehicle, observation.ego)
+        apply_state(self._vehicle, observation.ego, configure_shadow_physics=True)
 
         agents = list(observation.agents)
         tracking_ids = [agent.tracking_id for agent in agents]
@@ -1374,7 +1374,7 @@ class CarlaAgentAV:
                 self._spawned_actor_ids.add(actor.id)
                 self._other_actors.append(actor)
                 self._other_actor_types.append(obj.type)
-                apply_state(actor, obj, make_kinematic=True)
+                apply_state(actor, obj, configure_shadow_physics=True)
         else:
             if not getattr(self, "_using_tracking_ids", False):
                 self._destroy_other_actors()
@@ -1410,7 +1410,11 @@ class CarlaAgentAV:
                     self._other_actors_by_key[key] = actor
                     self._other_actor_types_by_key[key] = obj_type
 
-                apply_state(self._other_actors_by_key.get(key), obj, make_kinematic=True)
+                apply_state(
+                    self._other_actors_by_key.get(key),
+                    obj,
+                    configure_shadow_physics=True,
+                )
 
             for key in set(self._other_actors_by_key) - observed_keys:
                 actor = self._other_actors_by_key.pop(key)
